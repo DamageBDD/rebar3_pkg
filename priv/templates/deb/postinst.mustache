@@ -1,8 +1,22 @@
 #!/bin/sh
 set -eu
 
-APP="{{app}}"
-PREFIX="{{install_prefix}}"
+export APP="{{app}}"
+export PREFIX="{{install_prefix}}"
+export PKG_NAME="{{app}}"
+# Paths produced by your package layout
+export PREFIX="{{install_prefix}}"
+export BIN="${PREFIX}/bin/{{app}}"
+export LINK="/usr/bin/{{app}}"
+export ETC_DIR="{{etc_dir}}"
+export VAR_DIR="{{var_dir}}"
+export LOG_DIR="{{log_dir}}"
+# Service/user knobs (string flags so we can test in shell)
+export CREATE_USER="{{create_user}}"        # "true" or "false"
+export USER="{{user}}"
+export GROUP="{{group}}"
+export SERVICE_NAME="{{service_name}}"
+export AUTO_START="{{auto_start}}"          # "true" or "false"
 
 # Candidate hook directories:
 # 1) Optional system hook dir (if you ever stage one)

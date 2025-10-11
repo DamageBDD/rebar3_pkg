@@ -26,8 +26,9 @@ init(State) ->
 
     %% NEW: also register {pkg, docker} from the standalone module
     {ok, State2} = rebar3_pkg_docker:init(State1),
+    {ok, State3} = rebar3_ipfs_prv:init(State2),
 
-    {ok, State2}.
+    {ok, State3}.
 
 opts() ->
     [
@@ -204,7 +205,7 @@ find_release_vsn([H | T], AppName) ->
                 true -> to_list(Vsn);
                 false -> find_release_vsn(T, AppName)
             end;
-        Name ->
+        _Name ->
             find_release_vsn(T, AppName)
     end;
 find_release_vsn([], _AppName) ->
