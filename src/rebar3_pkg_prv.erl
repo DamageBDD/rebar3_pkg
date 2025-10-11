@@ -117,7 +117,6 @@ gen(State, Cfg, arch) -> do_arch(State, Cfg);
 gen(State, Cfg, rpm) -> do_rpm(State, Cfg);
 gen(State, Cfg, deb) -> do_deb(State, Cfg).
 
-
 current_profile(State) ->
     case rebar_state:current_profiles(State) of
         [P | _] -> atom_to_list(P);
@@ -168,54 +167,54 @@ find_appinfo(App, Apps) ->
         {_Name, AI} -> AI
     end.
 
-read_app_vsn_from_appfile(App, Profile) ->
-    Pat = filename:join([
-        "_build",
-        Profile,
-        "lib",
-        atom_to_list(App) ++ "-*",
-        "ebin",
-        atom_to_list(App) ++ ".app"
-    ]),
-    case filelib:wildcard(Pat) of
-        [AppFile | _] ->
-            case file:consult(AppFile) of
-                {ok, [{application, App, KVs}]} ->
-                    case lists:keyfind(vsn, 1, KVs) of
-                        {vsn, V} when is_binary(V) -> binary_to_list(V);
-                        {vsn, V} when is_list(V) -> V;
-                        _ -> undefined
-                    end;
-                _ ->
-                    undefined
-            end;
-        _ ->
-            undefined
-    end.
-
-decide_version(AppInfo, App, Profile, Args) ->
-    case proplists:get_value(version, Args) of
-        undefined ->
-            V0 =
-                try
-                    rebar_app_info:original_vsn(AppInfo)
-                catch
-                    _:_ -> undefined
-                end,
-            case V0 of
-                undefined ->
-                    case read_app_vsn_from_appfile(App, Profile) of
-                        undefined -> "0.0.0";
-                        V -> V
-                    end;
-                V ->
-                    V
-            end;
-        V ->
-            V
-    end.
-
 %% ---------- main ----------
+%% @doc Get the release version from _build/<Profile>/rel/<App>/releases/RELEASES
+-spec release_version(
+    Profile :: string() | atom(),
+    App :: atom() | string()
+) ->
+    {ok, string()} | {error, term()}.
+release_version(Profile0, App0) ->
+    Profile = to_list(Profile0),
+    AppName = to_list(App0),
+    File = filename:join(["_build", Profile, "rel", AppName, "releases", "RELEASES"]),
+    case file:consult(File) of
+        {ok, [Terms]} ->
+            case find_release_vsn(Terms, AppName) of
+                undefined -> {error, {not_found_in_releases, AppName}};
+                Vsn -> {ok, Vsn}
+            end;
+        Error ->
+            Error
+    end.
+
+%% ---- helpers ----
+
+to_list(A) when is_atom(A) -> atom_to_list(A);
+to_list(B) when is_binary(B) -> binary_to_list(B);
+to_list(L) when is_list(L) -> L.
+
+%% The RELEASES file is a list of terms; we look for:
+%%   {release, Name, Vsn, ErtsVsn, Apps}
+find_release_vsn([H | T], AppName) ->
+    case H of
+        {release, Name, Vsn, _Erts, _Apps, permanent} ->
+            rebar_api:error("Name ~p ~p", [Name, AppName]),
+
+            case same_name(Name, AppName) of
+                true -> to_list(Vsn);
+                false -> find_release_vsn(T, AppName)
+            end;
+        Name ->
+            rebar_api:error("Name ~p", [Name]),
+            find_release_vsn(T, AppName)
+    end;
+find_release_vsn([], _AppName) ->
+    undefined.
+
+same_name(Name, AppName) when is_atom(Name) -> atom_to_list(Name) =:= AppName;
+same_name(Name, AppName) when is_list(Name) -> Name =:= AppName;
+same_name(Name, AppName) when is_binary(Name) -> binary_to_list(Name) =:= AppName.
 
 project_meta(State, Cfg) ->
     {Args, _} = rebar_state:command_parsed_args(State),
@@ -259,8 +258,11 @@ project_meta(State, Cfg) ->
 
     Version =
         case AppAtom of
-            undefined -> proplists:get_value(version, Args, "0.0.0");
-            A1 -> decide_version(AppInfo, A1, Profile, Args)
+            undefined ->
+                proplists:get_value(version, Args, "0.0.0");
+            A1 ->
+                {ok, Vsn} = release_version(Profile, A1),
+                Vsn
         end,
 
     Arch =
@@ -286,8 +288,12 @@ project_meta(State, Cfg) ->
     Licenses = proplists:get_value(licenses, AppDetails),
     Description = proplists:get_value(description, AppDetails),
 
+    %rebar_api:info(
+    %    "state: ~p cfg: ~p",
+    %    [State, Cfg]
+    %),
     rebar_api:info(
-        "pkg: app=~s vsn=~s profile=~s basedir=~s appinfo=~p",
+        "pkg: app=~s vsn=~s profile=~s basedir=~s maintainer=~p",
         [AppName, Version, Profile, BaseDir, Maintainer]
     ),
 
