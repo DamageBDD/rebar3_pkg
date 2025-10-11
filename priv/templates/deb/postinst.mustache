@@ -1,13 +1,21 @@
 #!/bin/sh
-# Debug mode if requested
-[ "${PKG_DEBUG:-}" = "1" ] && set -x
-set -eu  # fail fast
-trap 'echo "[postinst] FAILED at line $LINENO"; exit 1' ERR
+# portable header for dpkg maintainer scripts
+set -eu
+umask 022
+export DEBIAN_FRONTEND=noninteractive
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-# Optional: capture everything to a log
-LOG=/var/log/<pkgname>-postinst.log
-exec 1>>"$LOG" 2>&1
-echo "[postinst] $(date -Is) starting…"
+on_exit() {
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[postinst] FAILED (rc=$rc)" >&2
+  else
+    echo "[postinst] OK" >&2
+  fi
+}
+trap on_exit EXIT HUP INT TERM
+
+
 
 export APP="{{app}}"
 export PREFIX="{{install_prefix}}"
