@@ -1,5 +1,13 @@
 #!/bin/sh
-set -eu
+# Debug mode if requested
+[ "${PKG_DEBUG:-}" = "1" ] && set -x
+set -eu  # fail fast
+trap 'echo "[postinst] FAILED at line $LINENO"; exit 1' ERR
+
+# Optional: capture everything to a log
+LOG=/var/log/<pkgname>-postinst.log
+exec 1>>"$LOG" 2>&1
+echo "[postinst] $(date -Is) starting…"
 
 export APP="{{app}}"
 export PREFIX="{{install_prefix}}"
