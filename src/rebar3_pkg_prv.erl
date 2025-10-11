@@ -199,14 +199,12 @@ to_list(L) when is_list(L) -> L.
 find_release_vsn([H | T], AppName) ->
     case H of
         {release, Name, Vsn, _Erts, _Apps, permanent} ->
-            rebar_api:error("Name ~p ~p", [Name, AppName]),
 
             case same_name(Name, AppName) of
                 true -> to_list(Vsn);
                 false -> find_release_vsn(T, AppName)
             end;
         Name ->
-            rebar_api:error("Name ~p", [Name]),
             find_release_vsn(T, AppName)
     end;
 find_release_vsn([], _AppName) ->
@@ -368,8 +366,6 @@ render_file(RelPath, Vars) ->
     Path = tmpl_path(RelPath),
     case file:read_file(Path) of
         {ok, Bin} ->
-            rebar_api:debug("template context ~p", [Vars]),
-
             bbmustache:render(Bin, normalize_context(Vars));
         _Error ->
             error(Path)
