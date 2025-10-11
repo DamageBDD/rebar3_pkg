@@ -1,0 +1,29 @@
+Name:           {{app}}
+Version:        {{version}}
+Release:        1%{?dist}
+Summary:        {{description}}
+License:        {{license}}
+URL:            {{homepage}}
+BuildArch:      {{arch}}
+
+%description
+{{description}}
+
+%prep
+
+%build
+
+%install
+mkdir -p %{buildroot}{{install_prefix}}/bin
+install -m 0755 {{bin_path}} %{buildroot}{{install_prefix}}/bin/{{app}}
+mkdir -p %{buildroot}/etc/{{app}} %{buildroot}/var/lib/{{app}} %{buildroot}/var/log/{{app}}
+
+%files
+{{install_prefix}}/bin/{{app}}
+%dir /etc/{{app}}
+%dir /var/lib/{{app}}
+%dir /var/log/{{app}}
+
+%changelog
+* Thu Oct 10 2025 {{maintainer}} - {{version}}-1
+- First packaging

@@ -1,0 +1,17 @@
+# Maintainer: {{maintainer}}
+pkgname={{app}}
+pkgver={{version}}
+pkgrel=1
+pkgdesc='{{description}}'
+arch=('{{arch}}')
+url='{{homepage}}'
+license=('{{license}}')
+depends=()
+source=()
+sha256sums=()
+
+package() {
+  install -d "$pkgdir{{install_prefix}}/bin"
+  install -m755 {{bin_path}} "$pkgdir{{install_prefix}}/bin/{{app}}"
+  install -d "$pkgdir/var/lib/{{app}}" "$pkgdir/var/log/{{app}}" "$pkgdir/etc/{{app}}"
+}
