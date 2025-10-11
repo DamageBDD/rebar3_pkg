@@ -53,7 +53,7 @@ run_hooks_dir() {
     # run-parts does not expand globs, so iterate matches
     for m in $d; do
       [ -d "$m" ] || continue
-      run-parts --exit-on-error "$m"
+      run-parts --exit-on-error --regex '.*.sh' "$m"
     done
   else
     for m in $d; do
