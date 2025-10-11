@@ -117,46 +117,156 @@ gen(State, Cfg, arch) -> do_arch(State, Cfg);
 gen(State, Cfg, rpm) -> do_rpm(State, Cfg);
 gen(State, Cfg, deb) -> do_deb(State, Cfg).
 
-project_meta(State, Cfg) ->
-    %% Active profile & build base dir
-    Profiles = rebar_state:current_profiles(State),
-    Profile =
-        case Profiles of
-            [P | _] -> atom_to_list(P);
-            [] -> "default"
-        end,
-    %% e.g. "_build/prod"
-    BaseDir = rebar_dir:base_dir(State),
 
-    %% CLI args (parsed)
+current_profile(State) ->
+    case rebar_state:current_profiles(State) of
+        [P | _] -> atom_to_list(P);
+        [] -> "default"
+    end.
+
+maybe_release_app_from_config(State) ->
+    %% Try to find {release, {App,_},_} or {release, App,_} in config
+    try
+        Opts = rebar_state:opts(State),
+        Relx =
+            case dict:find(relx, Opts) of
+                {ok, R} ->
+                    R;
+                error ->
+                    case rebar_state:project_config(State) of
+                        PC when is_list(PC) -> proplists:get_value(relx, PC, []);
+                        _ -> []
+                    end
+            end,
+        case lists:keyfind(release, 1, Relx) of
+            {release, {App, _}, _} when is_atom(App) -> {ok, App};
+            {release, App, _} when is_atom(App) -> {ok, App};
+            _ -> error
+        end
+    catch
+        _:_ -> error
+    end.
+
+maybe_release_app_from_build(Profile) ->
+    RelDir = filename:join(["_build", Profile, "rel"]),
+    case file:list_dir(RelDir) of
+        {ok, Entries} ->
+            Cands = [E || E <- Entries, E =/= "lib", not lists:prefix("erts-", E)],
+            case Cands of
+                [Name | _] -> {ok, list_to_atom(Name)};
+                [] -> error
+            end;
+        _ ->
+            error
+    end.
+
+find_appinfo(App, Apps) ->
+    %% Apps :: [rebar_app_info()]
+    Apps0 = [{rebar_app_info:name(AI), AI} || AI <- Apps],
+    case lists:keyfind(atom_to_binary(App), 1, Apps0) of
+        false -> undefined;
+        {_Name, AI} -> AI
+    end.
+
+read_app_vsn_from_appfile(App, Profile) ->
+    Pat = filename:join([
+        "_build",
+        Profile,
+        "lib",
+        atom_to_list(App) ++ "-*",
+        "ebin",
+        atom_to_list(App) ++ ".app"
+    ]),
+    case filelib:wildcard(Pat) of
+        [AppFile | _] ->
+            case file:consult(AppFile) of
+                {ok, [{application, App, KVs}]} ->
+                    case lists:keyfind(vsn, 1, KVs) of
+                        {vsn, V} when is_binary(V) -> binary_to_list(V);
+                        {vsn, V} when is_list(V) -> V;
+                        _ -> undefined
+                    end;
+                _ ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+decide_version(AppInfo, App, Profile, Args) ->
+    case proplists:get_value(version, Args) of
+        undefined ->
+            V0 =
+                try
+                    rebar_app_info:original_vsn(AppInfo)
+                catch
+                    _:_ -> undefined
+                end,
+            case V0 of
+                undefined ->
+                    case read_app_vsn_from_appfile(App, Profile) of
+                        undefined -> "0.0.0";
+                        V -> V
+                    end;
+                V ->
+                    V
+            end;
+        V ->
+            V
+    end.
+
+%% ---------- main ----------
+
+project_meta(State, Cfg) ->
     {Args, _} = rebar_state:command_parsed_args(State),
 
-    %% Discover the main app & version (prefer project app; fallback to relx; then defaults)
-    %Apps = rebar_state:project_apps(State),
-    Opts = rebar_state:opts(State),
-    Keys = [K || {K, _V} <- dict:to_list(Opts)],
-    rebar_api:info("Pkg Opts: ~p", [Keys]),
-    {release, {AppName0, _}, _Deps} = lists:keyfind(release, 1, dict:fetch(relx, Opts)),
-    Apps = rebar_state:project_apps(State),
-    [AppInfo | _] = Apps,
-    rebar_api:info("appinfo: ~p", [AppInfo]),
-    Vsn0 = rebar_app_info:original_vsn(AppInfo),
-
-    %% Allow overrides from CLI
-    Profile1 =
+    Profile0 = current_profile(State),
+    Profile =
         case proplists:get_value(profile, Args) of
-            undefined -> Profile;
-            P0 -> P0
+            undefined -> Profile0;
+            P -> P
         end,
+
+    %% Figure out the release app deterministically.
+    AppAtom0 =
+        case maybe_release_app_from_config(State) of
+            {ok, A} ->
+                A;
+            error ->
+                case maybe_release_app_from_build(Profile) of
+                    {ok, A} ->
+                        A;
+                    error ->
+                        case rebar_state:current_app(State) of
+                            undefined ->
+                                case rebar_state:project_apps(State) of
+                                    [AI | _] -> rebar_app_info:name(AI);
+                                    [] -> undefined
+                                end;
+                            AI ->
+                                rebar_app_info:name(AI)
+                        end
+                end
+        end,
+
+    AppAtom = AppAtom0,
+    Apps = rebar_state:project_apps(State),
+    AppInfo =
+        case AppAtom of
+            undefined -> undefined;
+            A0 -> find_appinfo(A0, Apps)
+        end,
+
     Version =
-        case proplists:get_value(version, Args) of
-            undefined -> Vsn0;
-            V -> V
+        case AppAtom of
+            undefined -> proplists:get_value(version, Args, "0.0.0");
+            A1 -> decide_version(AppInfo, A1, Profile, Args)
         end,
+
     Arch =
         case proplists:get_value(arch, Args) of
             undefined -> default_arch();
-            A0 -> A0
+            A2 -> A2
         end,
     OutDir =
         case proplists:get_value(out, Args) of
@@ -164,20 +274,66 @@ project_meta(State, Cfg) ->
             O -> O
         end,
 
-    %% Log (optional)
-    rebar_api:info("pkg: app=~s vsn=~s profile=~s basedir=~s", [
-        AppName0, Version, Profile1, BaseDir
-    ]),
+    AppName =
+        case AppAtom of
+            undefined -> "unknown_app";
+            A3 -> atom_to_list(A3)
+        end,
+    BaseDir = rebar_dir:base_dir(State),
+    AppDetails = rebar_app_info:app_details(AppInfo),
+    Maintainer = proplists:get_value(maintainer, AppDetails),
+    Links = proplists:get_value(links, AppDetails),
+    Licenses = proplists:get_value(licenses, AppDetails),
+    Description = proplists:get_value(description, AppDetails),
 
-    %% Meta used by generators/templates
+    rebar_api:info(
+        "pkg: app=~s vsn=~s profile=~s basedir=~s appinfo=~p",
+        [AppName, Version, Profile, BaseDir, Maintainer]
+    ),
+
     [
-        {app, AppName0},
+        {app, AppName},
         {version, Version},
+        {maintainer, Maintainer},
         {arch, Arch},
         {out_dir, OutDir},
-        {profile, Profile1},
-        {base_dir, BaseDir}
+        {profile, Profile},
+        {description, Description},
+        {base_dir, BaseDir},
+        {links, Links},
+        {licenses, Licenses}
     ] ++ Cfg.
+
+meta_to_vars(Meta) ->
+    App = safe_get(app, Meta, "app"),
+    #{
+        app => App,
+        version => proplists:get_value(version, Meta),
+        arch => proplists:get_value(arch, Meta),
+        maintainer => proplists:get_value(maintainer, Meta, "Unknown <noreply@example.org>"),
+        licenses => proplists:get_value(licenses, Meta, ["MIT"]),
+        links => proplists:get_value(links, Meta, ""),
+        homepage => proplists:get_value(homepage, Meta, ""),
+        description => proplists:get_value(description, Meta, App),
+        install_prefix => proplists:get_value(install_prefix, Meta, "/usr"),
+        service_name => proplists:get_value(service_name, Meta, App),
+        create_user => proplists:get_value(create_user, Meta, true),
+        user => proplists:get_value(user, Meta, App),
+        group => proplists:get_value(group, Meta, App),
+        bin_path => bin_path(Meta),
+        etc_dir => proplists:get_value(etc_dir, Meta, "/etc/" ++ App),
+        var_dir => proplists:get_value(var_dir, Meta, "/var/lib/" ++ App),
+        log_dir => proplists:get_value(log_dir, Meta, "/var/log/" ++ App),
+        unit_wants => proplists:get_value(unit_wants, Meta, "network-online.target"),
+        out_dir => proplists:get_value(out_dir, Meta, "_build/pkg"),
+        auto_start => proplists:get_value(auto_start, Meta, true),
+
+        %% NEW: kerl bootstrap knobs
+        otp_version => proplists:get_value(otp_version, Meta, "28.0.2"),
+        rebar3_url => proplists:get_value(
+            rebar3_url, Meta, "https://s3.amazonaws.com/rebar3/rebar3"
+        )
+    }.
 
 default_arch() ->
     case os:type() of
@@ -205,11 +361,12 @@ tmpl_path(RelPath) ->
 render_file(RelPath, Vars) ->
     Path = tmpl_path(RelPath),
     case file:read_file(Path) of
-        {ok, Bin} -> 
-                            rebar_api:debug("template context ~p", [Vars]),
+        {ok, Bin} ->
+            rebar_api:debug("template context ~p", [Vars]),
 
-bbmustache:render(Bin, normalize_context(Vars));
-        _Error     -> error(Path)
+            bbmustache:render(Bin, normalize_context(Vars));
+        _Error ->
+            error(Path)
     end.
 
 bin_path(Meta) ->
@@ -265,32 +422,36 @@ to_map(L) when is_list(L) -> maps:from_list(L).
 merge_meta(Base, Adds) ->
     maps:merge(to_map(Base), to_map(Adds)).
 
-
 %% ---------- Target generators ----------
 
 do_deb(State, Cfg) ->
-    Meta   = project_meta(State, Cfg),
+    Meta = project_meta(State, Cfg),
     OutDir = safe_get(out_dir, Meta, "_build/pkg"),
-    App    = safe_get(app, Meta, "unknown_app"),
-    Base   = join_all([OutDir, "deb", App]),
+    App = safe_get(app, Meta, "unknown_app"),
+    Base = join_all([OutDir, "deb", App]),
     ensure_out_dir(Base),
-    Vars   = meta_to_vars(Meta),
+    Vars = meta_to_vars(Meta),
 
-    ok = write_file(join_all([Base, "DEBIAN", "control"]),
-                    render_file("deb/control.mustache", Vars)),
+    ok = write_file(
+        join_all([Base, "DEBIAN", "control"]),
+        render_file("deb/control.mustache", Vars)
+    ),
     Postinst = join_all([Base, "DEBIAN", "postinst"]),
     ok = write_file(Postinst, render_file("deb/postinst.mustache", Vars)),
     ok = file:change_mode(Postinst, 8#755),
 
     %% collect CLI/config fpm flag and ensure proper install_prefix for runtime
     {Args, _} = rebar_state:command_parsed_args(State),
-    FpmFlag   = case proplists:get_value(fpm, Args) of
-                    true  -> true;
-                    false -> false;
-                    undefined ->
-                        %% fallback to config `{pkg, [{fpm, true}|...]}` or default true
-                        proplists:get_value(fpm, Cfg, true)
-                end,
+    FpmFlag =
+        case proplists:get_value(fpm, Args) of
+            true ->
+                true;
+            false ->
+                false;
+            undefined ->
+                %% fallback to config `{pkg, [{fpm, true}|...]}` or default true
+                proplists:get_value(fpm, Cfg, true)
+        end,
 
     %% prefer /opt/<app> when bundling a relx release
     InstallPrefix = proplists:get_value(install_prefix, Meta, filename:join("/opt", App)),
@@ -305,63 +466,37 @@ do_deb(State, Cfg) ->
     rebar_api:info("deb: wrote control & postinst in ~s", [Base]),
     ok.
 
-
 do_arch(State, Cfg) ->
-    Meta  = project_meta(State, Cfg),
-    OutDir= safe_get(out_dir, Meta, "_build/pkg"),
-    App   = safe_get(app, Meta, "unknown_app"),
-    Out   = join_all([OutDir, "arch", App]),
+    Meta = project_meta(State, Cfg),
+    OutDir = safe_get(out_dir, Meta, "_build/pkg"),
+    App = safe_get(app, Meta, "unknown_app"),
+    Out = join_all([OutDir, "arch", App]),
     ensure_out_dir(Out),
-    Vars  = meta_to_vars(Meta),
+    Vars = meta_to_vars(Meta),
 
-    ok = write_file(join_all([Out, "PKGBUILD"]),
-                    render_file("arch/PKGBUILD.mustache", Vars)),
+    ok = write_file(
+        join_all([Out, "PKGBUILD"]),
+        render_file("arch/PKGBUILD.mustache", Vars)
+    ),
     maybe_fpm(Vars, arch),
     rebar_api:info("arch: wrote ~s", [join_all([Out, "PKGBUILD"])]),
     ok.
 
 do_rpm(State, Cfg) ->
-    Meta  = project_meta(State, Cfg),
-    OutDir= safe_get(out_dir, Meta, "_build/pkg"),
-    App   = safe_get(app, Meta, "unknown_app"),
-    Out   = join_all([OutDir, "rpm", App]),
+    Meta = project_meta(State, Cfg),
+    OutDir = safe_get(out_dir, Meta, "_build/pkg"),
+    App = safe_get(app, Meta, "unknown_app"),
+    Out = join_all([OutDir, "rpm", App]),
     ensure_out_dir(Out),
-    Vars  = meta_to_vars(Meta),
+    Vars = meta_to_vars(Meta),
 
-    ok = write_file(join_all([Out, App ++ ".spec"]),
-                    render_file("rpm/spec.mustache", Vars)),
+    ok = write_file(
+        join_all([Out, App ++ ".spec"]),
+        render_file("rpm/spec.mustache", Vars)
+    ),
     maybe_fpm(Vars, rpm),
     rebar_api:info("rpm: wrote spec to ~s", [Out]),
     ok.
-
-meta_to_vars(Meta) ->
-    App = safe_get(app, Meta, "app"),
-    #{
-      app => App,
-      version => proplists:get_value(version, Meta),
-      arch => proplists:get_value(arch, Meta),
-      maintainer => proplists:get_value(maintainer, Meta, "Unknown <noreply@example.org>"),
-      license => proplists:get_value(license, Meta, "MIT"),
-      homepage => proplists:get_value(homepage, Meta, ""),
-      description => proplists:get_value(description, Meta, App),
-      install_prefix => proplists:get_value(install_prefix, Meta, "/usr"),
-      service_name => proplists:get_value(service_name, Meta, App),
-      create_user => proplists:get_value(create_user, Meta, true),
-      user => proplists:get_value(user, Meta, App),
-      group => proplists:get_value(group, Meta, App),
-      bin_path => bin_path(Meta),
-      etc_dir => proplists:get_value(etc_dir, Meta, "/etc/" ++ App),
-      var_dir => proplists:get_value(var_dir, Meta, "/var/lib/" ++ App),
-      log_dir => proplists:get_value(log_dir, Meta, "/var/log/" ++ App),
-      unit_wants => proplists:get_value(unit_wants, Meta, "network-online.target"),
-      out_dir => proplists:get_value(out_dir, Meta, "_build/pkg"),
-      auto_start => proplists:get_value(auto_start, Meta, true),
-
-      %% NEW: kerl bootstrap knobs
-      otp_version => proplists:get_value(otp_version, Meta, "28.0.2"),
-      rebar3_url  => proplists:get_value(rebar3_url,  Meta, "https://s3.amazonaws.com/rebar3/rebar3")
-    }.
-
 
 %% ---- fpm integration (fpm >= 1.17.0) -------------------------------
 
@@ -372,27 +507,27 @@ maybe_fpm(Meta, Target) ->
             rebar_api:info("Not using fpm.", []),
             ok;
         true ->
-            App      = maps:get(app, Meta),
-            Version  = maps:get(version, Meta),
-            Arch     = maps:get(arch, Meta, "native"),
-            Prefix   = maps:get(install_prefix, Meta, filename:join("/opt", App)),
-            Bin      = maps:get(bin_path, Meta),
+            App = maps:get(app, Meta),
+            Version = maps:get(version, Meta),
+            Arch = maps:get(arch, Meta, "native"),
+            Prefix = maps:get(install_prefix, Meta, filename:join("/opt", App)),
+            Bin = maps:get(bin_path, Meta),
 
-            BinDir   = filename:dirname(Bin),
-            RelDir   = filename:dirname(BinDir),
+            BinDir = filename:dirname(Bin),
+            RelDir = filename:dirname(BinDir),
 
-            OutBase  = maps:get(out_dir, Meta, "_build/pkg"),
-            Maint    = maps:get(maintainer,  Meta, undefined),
-            Lic      = maps:get(license,     Meta, undefined),
-            Url      = maps:get(homepage,    Meta, undefined),
-            Desc     = maps:get(description, Meta, undefined),
+            OutBase = maps:get(out_dir, Meta, "_build/pkg"),
+            Maint = maps:get(maintainer, Meta, undefined),
+            Lic = maps:get(license, Meta, undefined),
+            Url = maps:get(homepage, Meta, undefined),
+            Desc = maps:get(description, Meta, undefined),
 
-            AI = maps:get(after_install,  Meta, undefined),
+            AI = maps:get(after_install, Meta, undefined),
             BI = maps:get(before_install, Meta, undefined),
-            AR = maps:get(after_remove,   Meta, undefined),
-            BR = maps:get(before_remove,  Meta, undefined),
+            AR = maps:get(after_remove, Meta, undefined),
+            BR = maps:get(before_remove, Meta, undefined),
 
-            TypeStr   = target_to_type(Target),
+            TypeStr = target_to_type(Target),
             TargetDir = filename:join(OutBase, type_to_dir(Target)),
             ok = filelib:ensure_dir(filename:join(TargetDir, "placeholder")),
 
@@ -403,40 +538,70 @@ maybe_fpm(Meta, Target) ->
             OutArg = filename:join(TargetDir, "") ++ "/",
 
             BaseArgs = [
-                "fpm","-s","dir",
-                "-t", TypeStr,
-                "-n", App,
-                "-v", Version,
-                "-a", Arch,
-                "--prefix", Prefix,
-                "-p", OutArg,
+                "fpm",
+                "-s",
+                "dir",
+                "-t",
+                TypeStr,
+                "-n",
+                App,
+                "-v",
+                Version,
+                "-a",
+                Arch,
+                "--prefix",
+                Prefix,
+                "-p",
+                OutArg,
                 "--force"
             ],
 
             OptMeta =
-                add_opt("--maintainer", Maint,
-                add_opt("--license",    Lic,
-                add_opt("--url",        Url,
-                add_opt("--description",Desc, [])))),
+                add_opt(
+                    "--maintainer",
+                    Maint,
+                    add_opt(
+                        "--license",
+                        Lic,
+                        add_opt(
+                            "--url",
+                            Url,
+                            add_opt("--description", Desc, [])
+                        )
+                    )
+                ),
 
             ScriptMeta =
-                add_opt("--after-install",  AI,
-                add_opt("--before-install", BI,
-                add_opt("--after-remove",   AR,
-                add_opt("--before-remove",  BR, [])))),
+                add_opt(
+                    "--after-install",
+                    AI,
+                    add_opt(
+                        "--before-install",
+                        BI,
+                        add_opt(
+                            "--after-remove",
+                            AR,
+                            add_opt("--before-remove", BR, [])
+                        )
+                    )
+                ),
 
             Argv = BaseArgs ++ OptMeta ++ ScriptMeta ++ ["-C", RelDir, "."],
-            Cmd  = string:join([shell_escape(A) || A <- Argv], " "),
+            Cmd = string:join([shell_escape(A) || A <- Argv], " "),
 
             rebar_api:info("fpm cmd: ~s", [Cmd]),
 
             Full = "sh -c " ++ shell_escape(Cmd ++ " ; printf '\\nEXIT:%s' $?"),
-            Out  = os:cmd(Full),
+            Out = os:cmd(Full),
 
             %% --- no guards calling functions ---
-            Lines    = string:tokens(Out, "\n"),
-            ExitLine = case Lines of [] -> "EXIT:255"; _ -> lists:last(Lines) end,
-            IsExit   = lists:prefix("EXIT:", ExitLine),
+            Lines = string:tokens(Out, "\n"),
+            ExitLine =
+                case Lines of
+                    [] -> "EXIT:255";
+                    _ -> lists:last(Lines)
+                end,
+            IsExit = lists:prefix("EXIT:", ExitLine),
 
             case IsExit of
                 true ->
@@ -457,9 +622,6 @@ maybe_fpm(Meta, Target) ->
                     {error, fpm_output_unexpected}
             end
     end.
-
-
-
 
 target_to_type(arch) -> "pacman";
 target_to_type(rpm) -> "rpm";
