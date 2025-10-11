@@ -1,6 +1,7 @@
 #!/bin/sh
 # portable header for dpkg maintainer scripts
 set -eu
+set -x
 umask 022
 export DEBIAN_FRONTEND=noninteractive
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -40,6 +41,7 @@ export AUTO_START="{{auto_start}}"          # "true" or "false"
 HOOK_DIRS="
 /usr/lib/${APP}/postinst.d
 ${PREFIX}/lib/${APP}-*/priv/pkg/postinst.d
+/opt/${APP}/lib/${APP}-*/priv/pkg/postinst.d
 "
 
 run_hooks_dir() {
