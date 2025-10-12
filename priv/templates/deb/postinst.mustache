@@ -21,7 +21,7 @@ export APP="{{app}}"
 export PKG_NAME="{{app}}"
 # Paths produced by your package layout
 export PREFIX="{{install_prefix}}"
-export BIN="${PREFIX}/bin/{{app}}"
+export BIN="${PREFIX}/{{app}}/bin/{{app}}"
 export LINK="/usr/bin/{{app}}"
 export ETC_DIR="{{etc_dir}}"
 export VAR_DIR="{{var_dir}}"
@@ -38,8 +38,7 @@ export AUTO_START="{{auto_start}}"          # "true" or "false"
 # 2) The relx app priv path shipped in the package
 HOOK_DIRS="
 /usr/lib/${APP}/postinst.d
-${PREFIX}/lib/${APP}-*/priv/pkg/postinst.d
-/opt/${APP}/lib/${APP}-*/priv/pkg/postinst.d
+${PREFIX}/${APP}/lib/${APP}-*/priv/pkg/postinst.d
 "
 
 run_hooks_dir() {
