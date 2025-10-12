@@ -320,7 +320,7 @@ meta_to_vars(Meta) ->
         links => proplists:get_value(links, Meta, ""),
         homepage => proplists:get_value(homepage, Meta, ""),
         description => proplists:get_value(description, Meta, App),
-        install_prefix => proplists:get_value(install_prefix, Meta, "/usr"),
+        install_prefix => proplists:get_value(install_prefix, Meta, "/opt"),
         service_name => proplists:get_value(service_name, Meta, App),
         create_user => proplists:get_value(create_user, Meta, true),
         user => proplists:get_value(user, Meta, App),
@@ -333,6 +333,9 @@ meta_to_vars(Meta) ->
         out_dir => proplists:get_value(out_dir, Meta, "_build/pkg"),
         auto_start => proplists:get_value(auto_start, Meta, true),
 
+        depends => proplists:get_value(depends, Meta, ""),
+        recommends => proplists:get_value(recommends, Meta, ""),
+        suggests => proplists:get_value(suggests, Meta, ""),
         %% NEW: kerl bootstrap knobs
         otp_version => proplists:get_value(otp_version, Meta, "28.0.2"),
         rebar3_url => proplists:get_value(

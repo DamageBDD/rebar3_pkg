@@ -1,8 +1,15 @@
 Package: {{app}}
 Version: {{version}}
-Section: utils
-Priority: optional
 Architecture: {{arch}}
 Maintainer: {{maintainer}}
-Homepage: {{homepage}}
 Description: {{description}}
+{{#depends}}
+Depends: {{depends}}
+{{/depends}}
+{{#recommends}}
+Recommends: {{recommends}}
+{{/recommends}}
+{{#suggests}}
+Suggests: {{suggests}}
+{{/suggests}}
+
