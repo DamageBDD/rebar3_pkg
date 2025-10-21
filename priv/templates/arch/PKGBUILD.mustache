@@ -1,17 +1,68 @@
+# -*- mode: sh; sh-shell: bash; sh-basic-offset: 2; indent-tabs-mode: nil; -*-
 # Maintainer: {{maintainer}}
+
 pkgname={{app}}
 pkgver={{version}}
 pkgrel=1
 pkgdesc='{{description}}'
 arch=('{{arch}}')
 url='{{homepage}}'
-license=('{{license}}')
-depends=()
+license=('{{licenses}}')
+
+# No tarball — we rely on the relx release folder produced by rebar3
+# This is expected to be present relative to PKGBUILD during build:
+#   ../../_build/prod/rel/{{app}}
 source=()
 sha256sums=()
-
 package() {
-  install -d "$pkgdir{{install_prefix}}/bin"
-  install -m755 {{bin_path}} "$pkgdir{{install_prefix}}/bin/{{app}}"
-  install -d "$pkgdir/var/lib/{{app}}" "$pkgdir/var/log/{{app}}" "$pkgdir/etc/{{app}}"
+  # 1) Copy the relx release into the package tree
+  local relsrc="{{base_dir}}/rel/"
+
+  # Make sure we don’t get a trailing slash in the prefix
+  local prefix="{{install_prefix}}"
+  prefix="${prefix%/}"
+
+  # Use the app name directly instead of $pkgname
+  local reltarget="${prefix}/{{app}}"
+
+  install -d "$pkgdir/$reltarget"
+  cp -a "$relsrc/" "$pkgdir/$reltarget/"
+
+  # 2) Convenience symlink in /usr/bin
+  install -d "$pkgdir/usr/bin"
+  ln -sf "$reltarget/bin/{{app}}" "$pkgdir/usr/bin/{{app}}"
+
+
+  # 3) Create standard runtime/config directories
+  install -d \
+    "$pkgdir/var/lib/{{app}}" \
+    "$pkgdir/var/log/{{app}}" \
+    "$pkgdir/etc/{{app}}"
+
+  # 4) Optional: ship sys.config if available
+  if [[ -f "{{sysconfig}}" ]]; then
+    install -Dm644 "{{sysconfig}}" \
+      "$pkgdir/etc/{{app}}/sys.config"
+  fi
+
+  # 5) Optional: systemd unit
+  if [[ -f "{{systemd_unit}}" ]]; then
+    install -Dm644 "{{systemd_unit}}" \
+      "$pkgdir/usr/lib/systemd/system/{{app}}.service"
+  fi
+
+  # 6) Optional: docs (README, CHANGELOG, etc.)
+  if [[ -d "{{docs_dir}}" ]]; then
+    find "{{docs_dir}}" -type f -maxdepth 1 -print0 | while IFS= read -r -d '' f; do
+      install -Dm644 "$f" "$pkgdir/usr/share/doc/{{app}}/${f##*/}"
+    done
+  fi
+
+  # 7) Optional: post-install hook scripts (for external use)
+  if [[ -d "{{hook_dir}}" ]]; then
+    find "{{hook_dir}}" -type f -print0 | while IFS= read -r -d '' f; do
+      install -Dm755 "$f" "$pkgdir/usr/share/{{app}}/postinst.d/${f##*/}"
+    done
+  fi
 }
+

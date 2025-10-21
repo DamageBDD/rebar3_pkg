@@ -120,7 +120,8 @@ gen(State, Cfg, deb) -> do_deb(State, Cfg).
 
 current_profile(State) ->
     case rebar_state:current_profiles(State) of
-        [P | _] -> atom_to_list(P);
+        % Currently only support one profile at a time
+        [default, P] -> atom_to_list(P);
         [] -> "default"
     end.
 
@@ -179,12 +180,10 @@ release_version(Profile0, App0) ->
     Profile = to_list(Profile0),
     AppName = to_list(App0),
     File = filename:join(["_build", Profile, "rel", AppName, "releases", "RELEASES"]),
+    rebar_api:info("RELEASE file ~p", [File]),
     case file:consult(File) of
-        {ok, [Terms]} ->
-            case find_release_vsn(Terms, AppName) of
-                undefined -> {error, {not_found_in_releases, AppName}};
-                Vsn -> {ok, Vsn}
-            end;
+        {ok, [[{release, AppName, Version, _ErtsVsn, _Apps, permanent}]]} ->
+            {ok, Version};
         Error ->
             Error
     end.
@@ -200,7 +199,6 @@ to_list(L) when is_list(L) -> L.
 find_release_vsn([H | T], AppName) ->
     case H of
         {release, Name, Vsn, _Erts, _Apps, permanent} ->
-
             case same_name(Name, AppName) of
                 true -> to_list(Vsn);
                 false -> find_release_vsn(T, AppName)
@@ -217,6 +215,7 @@ same_name(Name, AppName) when is_binary(Name) -> binary_to_list(Name) =:= AppNam
 
 project_meta(State, Cfg) ->
     {Args, _} = rebar_state:command_parsed_args(State),
+    rebar_api:info("Args ~p", [Args]),
 
     Profile0 = current_profile(State),
     Profile =
@@ -258,9 +257,11 @@ project_meta(State, Cfg) ->
     Version =
         case AppAtom of
             undefined ->
+                rebar_api:info("Arg Version ~p", [Args]),
                 proplists:get_value(version, Args, "0.0.0");
             A1 ->
                 {ok, Vsn} = release_version(Profile, A1),
+                rebar_api:info("Release Version ~p", [Vsn]),
                 Vsn
         end,
 
@@ -284,7 +285,7 @@ project_meta(State, Cfg) ->
     AppDetails = rebar_app_info:app_details(AppInfo),
     Maintainer = proplists:get_value(maintainer, AppDetails),
     Links = proplists:get_value(links, AppDetails),
-    Licenses = proplists:get_value(licenses, AppDetails),
+    Licenses = string:join(proplists:get_value(licenses, AppDetails), " "),
     Description = proplists:get_value(description, AppDetails),
 
     %rebar_api:info(
@@ -320,12 +321,13 @@ meta_to_vars(Meta) ->
         links => proplists:get_value(links, Meta, ""),
         homepage => proplists:get_value(homepage, Meta, ""),
         description => proplists:get_value(description, Meta, App),
-        install_prefix => proplists:get_value(install_prefix, Meta, "/opt"),
+        install_prefix => proplists:get_value(install_prefix, Meta, filename:join("/opt", App)),
         service_name => proplists:get_value(service_name, Meta, App),
         create_user => proplists:get_value(create_user, Meta, "true"),
         user => proplists:get_value(user, Meta, App),
         group => proplists:get_value(group, Meta, App),
         bin_path => bin_path(Meta),
+        base_dir => proplists:get_value(base_dir, Meta),
         etc_dir => proplists:get_value(etc_dir, Meta, "/etc/" ++ App),
         var_dir => proplists:get_value(var_dir, Meta, "/var/lib/" ++ App),
         log_dir => proplists:get_value(log_dir, Meta, "/var/log/" ++ App),
@@ -479,6 +481,7 @@ do_arch(State, Cfg) ->
     Out = join_all([OutDir, "arch", App]),
     ensure_out_dir(Out),
     Vars = meta_to_vars(Meta),
+    rebar_api:info("arch ~p", [Vars]),
 
     ok = write_file(
         join_all([Out, "PKGBUILD"]),
@@ -505,6 +508,11 @@ do_rpm(State, Cfg) ->
     ok.
 
 %% ---- fpm integration (fpm >= 1.17.0) -------------------------------
+strip_trailing_slash(P) ->
+    case lists:last(P) of
+        $/ -> lists:sublist(P, 1, length(P) - 1);
+        _ -> P
+    end.
 
 maybe_fpm(Meta, Target) ->
     UseFpm = (maps:get(fpm, Meta, true) =:= true),
@@ -514,11 +522,20 @@ maybe_fpm(Meta, Target) ->
             ok;
         true ->
             App = maps:get(app, Meta),
+            % Normalize prefix so we always get /opt/<app>
+            Prefix0 = maps:get(install_prefix, Meta, filename:join("/opt", App)),
+            Prefix1 = strip_trailing_slash(Prefix0),
+            Prefix =
+                case filename:basename(Prefix1) of
+                    % already /opt/<app>
+                    App -> Prefix1;
+                    % becomes /opt/<app>
+                    _ -> filename:join(Prefix1, App)
+                end,
             Version = maps:get(version, Meta),
             Arch = maps:get(arch, Meta, "native"),
-            Prefix = maps:get(install_prefix, Meta, filename:join("/opt", App)),
-            Bin = maps:get(bin_path, Meta),
 
+            Bin = maps:get(bin_path, Meta),
             BinDir = filename:dirname(Bin),
             RelDir = filename:dirname(BinDir),
 
