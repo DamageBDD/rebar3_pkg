@@ -1,0 +1,77 @@
+# -*- mode: sh; sh-shell: bash; sh-basic-offset: 2; indent-tabs-mode: nil; -*-
+
+post_install() {
+
+ETC_DIR="{{etc_dir}}"
+VAR_DIR="{{var_dir}}"
+LOG_DIR="{{log_dir}}"
+SERVICE_NAME="{{service_name}}"
+INSTALL_DIR="{{install_prefix}}/{{app}}"
+SERVICE_FILE="/etc/systemd/system/{{service_name}}.service"
+  umask 022
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description={{description}}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{user}}
+Group={{group}}
+Environment=SHELL=sh
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/bin/{{app}} foreground
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+StateDirectory={{app}}
+LogsDirectory={{app}}
+
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "$SERVICE_FILE"
+  chown -R "$USER:$GROUP" "$VAR_DIR" "$LOG_DIR" || true
+  # Realize sysusers/tmpfiles we ship with the package
+  command -v systemd-sysusers >/dev/null 2>&1 && systemd-sysusers {{app}}.conf
+  command -v systemd-tmpfiles >/dev/null 2>&1 && systemd-tmpfiles --create {{app}}.conf
+
+  # Reload units in case we ship/change a systemd service
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload
+
+KEY_PATH="${VAR_DIR}/ssh_daemon/ssh_host_rsa_key"
+
+# Create directory if it doesn't exist
+mkdir -p "$(dirname "$KEY_PATH")"
+chmod 700 "$(dirname "$KEY_PATH")"
+
+# Generate key only if missing
+if [ ! -f "$KEY_PATH" ]; then
+    echo "[INFO] Generating new SSH host key: $KEY_PATH"
+    ssh-keygen -t rsa -b 4096 -f "$KEY_PATH" -N ""
+    chmod 600 "$KEY_PATH"
+    chmod 644 "${KEY_PATH}.pub"
+else
+    echo "[INFO] SSH host key already exists at $KEY_PATH — skipping generation."
+fi
+
+  echo ">>> {{app}} installed."
+  echo ">>> If you use systemd: sudo systemctl enable --now {{app}}.service"
+}
+
+post_upgrade() {
+  post_install
+}
+
+pre_remove() {
+  # Don’t fail if the service isn't present/running
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now {{app}}.service >/dev/null 2>&1 || true
+  fi
+}
+
+post_remove() {
+  : # keep logs/data; tmpfiles/sysusers handle ownership on next install
+}

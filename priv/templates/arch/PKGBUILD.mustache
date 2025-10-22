@@ -8,6 +8,10 @@ pkgdesc='{{description}}'
 arch=('{{arch}}')
 url='{{homepage}}'
 license=('{{licenses}}')
+install={{app}}.install
+depends={{depends}}
+optdepends={{optdepends}}
+
 
 # No tarball — we rely on the relx release folder produced by rebar3
 # This is expected to be present relative to PKGBUILD during build:
@@ -16,14 +20,14 @@ source=()
 sha256sums=()
 package() {
   # 1) Copy the relx release into the package tree
-  local relsrc="{{base_dir}}/rel/"
+  local relsrc="{{base_dir}}/rel/{{app}}/"
 
   # Make sure we don’t get a trailing slash in the prefix
   local prefix="{{install_prefix}}"
   prefix="${prefix%/}"
 
   # Use the app name directly instead of $pkgname
-  local reltarget="${prefix}/{{app}}"
+  local reltarget="${prefix}"
 
   install -d "$pkgdir/$reltarget"
   cp -a "$relsrc/" "$pkgdir/$reltarget/"
@@ -32,6 +36,26 @@ package() {
   install -d "$pkgdir/usr/bin"
   ln -sf "$reltarget/bin/{{app}}" "$pkgdir/usr/bin/{{app}}"
 
+  local sysusers="$pkgdir/usr/lib/sysusers.d"
+  local tmpfiles="$pkgdir/usr/lib/tmpfiles.d"
+
+    # --- systemd sysusers + tmpfiles (parameterized via mustache) ---
+  install -d "$pkgdir/usr/lib/sysusers.d" "$pkgdir/usr/lib/tmpfiles.d"
+
+  # sysusers: create group/user and add user to group
+  cat >"$pkgdir/usr/lib/sysusers.d/{{app}}.conf" <<'EOF'
+g {{group}} - - - - -
+u {{user}}  - "{{app}} service user" - -
+m {{user}}  {{group}}
+EOF
+
+  # tmpfiles: create runtime/log/config dirs with ownership
+  cat >"$pkgdir/usr/lib/tmpfiles.d/{{app}}.conf" <<'EOF'
+d {{var_dir}} 0750 {{user}} {{group}} -
+d {{log_dir}} 0755 {{user}} {{group}} -
+# Optional if you want system-level config dir managed too:
+# d /etc/{{app}} 0755 root root -
+EOF
 
   # 3) Create standard runtime/config directories
   install -d \

@@ -122,6 +122,7 @@ current_profile(State) ->
     case rebar_state:current_profiles(State) of
         % Currently only support one profile at a time
         [default, P] -> atom_to_list(P);
+        [default] -> "default";
         [] -> "default"
     end.
 
@@ -193,25 +194,6 @@ release_version(Profile0, App0) ->
 to_list(A) when is_atom(A) -> atom_to_list(A);
 to_list(B) when is_binary(B) -> binary_to_list(B);
 to_list(L) when is_list(L) -> L.
-
-%% The RELEASES file is a list of terms; we look for:
-%%   {release, Name, Vsn, ErtsVsn, Apps}
-find_release_vsn([H | T], AppName) ->
-    case H of
-        {release, Name, Vsn, _Erts, _Apps, permanent} ->
-            case same_name(Name, AppName) of
-                true -> to_list(Vsn);
-                false -> find_release_vsn(T, AppName)
-            end;
-        _Name ->
-            find_release_vsn(T, AppName)
-    end;
-find_release_vsn([], _AppName) ->
-    undefined.
-
-same_name(Name, AppName) when is_atom(Name) -> atom_to_list(Name) =:= AppName;
-same_name(Name, AppName) when is_list(Name) -> Name =:= AppName;
-same_name(Name, AppName) when is_binary(Name) -> binary_to_list(Name) =:= AppName.
 
 project_meta(State, Cfg) ->
     {Args, _} = rebar_state:command_parsed_args(State),
@@ -321,7 +303,7 @@ meta_to_vars(Meta) ->
         links => proplists:get_value(links, Meta, ""),
         homepage => proplists:get_value(homepage, Meta, ""),
         description => proplists:get_value(description, Meta, App),
-        install_prefix => proplists:get_value(install_prefix, Meta, filename:join("/opt", App)),
+        install_prefix => proplists:get_value(install_prefix, Meta, "/opt"),
         service_name => proplists:get_value(service_name, Meta, App),
         create_user => proplists:get_value(create_user, Meta, "true"),
         user => proplists:get_value(user, Meta, App),
@@ -331,6 +313,7 @@ meta_to_vars(Meta) ->
         etc_dir => proplists:get_value(etc_dir, Meta, "/etc/" ++ App),
         var_dir => proplists:get_value(var_dir, Meta, "/var/lib/" ++ App),
         log_dir => proplists:get_value(log_dir, Meta, "/var/log/" ++ App),
+        systemd_unit => proplists:get_value(systemd_unit, Meta, ""),
         unit_wants => proplists:get_value(unit_wants, Meta, "network-online.target"),
         out_dir => proplists:get_value(out_dir, Meta, "_build/pkg"),
         auto_start => proplists:get_value(auto_start, Meta, "true"),
@@ -429,6 +412,57 @@ to_map(L) when is_list(L) -> maps:from_list(L).
 
 merge_meta(Base, Adds) ->
     maps:merge(to_map(Base), to_map(Adds)).
+%% Collect platform-specific specs as a flat list of strings
+plat_specs(Meta, Key, Platform) ->
+    Raw = proplists:get_value(Key, Meta, []),
+    Items =
+        case Raw of
+            undefined -> [];
+            % single string
+            S when is_list(S), S =/= [], is_integer(hd(S)) -> [S];
+            % list [...]
+            L when is_list(L) -> L;
+            A when is_atom(A) -> [atom_to_list(A)];
+            B when is_binary(B) -> [binary_to_list(B)];
+            _ -> []
+        end,
+    lists:append([to_keep(I, Platform) || I <- Items]).
+
+%% Keep only entries for the current platform (or 'all'), and
+%% always return a *list of strings*.
+to_keep({Plat, Spec}, Platform) when Plat =:= Platform -> normalize_spec(Spec);
+to_keep({all, Spec}, _Platform) -> normalize_spec(Spec);
+to_keep({_, _}, _Platform) -> [];
+to_keep(Spec, _Platform) -> normalize_spec(Spec).
+
+%% Normalize one item:
+%%  - If it's a single string/atom/binary -> [String]
+%%  - If it's a list of strings -> [String, ...]
+normalize_spec(S) when is_list(S), S =/= [], is_integer(hd(S)) ->
+    % a single string
+    [S];
+normalize_spec(L) when is_list(L) ->
+    % list of strings
+    [to_str(E) || E <- L];
+normalize_spec(S) ->
+    % single non-list
+    [to_str(S)].
+
+to_str(S) when is_list(S) -> S;
+to_str(S) when is_atom(S) -> atom_to_list(S);
+to_str(S) when is_binary(S) -> binary_to_list(S).
+
+%% Debian control field joiner: "a, b, c" or "" if none
+-spec deb_join([string()]) -> string().
+deb_join([]) -> "";
+deb_join(L) -> string:join(L, ", ").
+
+%% Arch PKGBUILD helper:
+%% Return **just the quoted items**: "'a' 'b'" (no parentheses).
+%% Let the template add the surrounding ().
+-spec arch_array_items([string()]) -> string().
+arch_array_items([]) -> "";
+arch_array_items(L) -> "('" ++ string:join(L, "' '") ++ "')".
 
 %% ---------- Target generators ----------
 
@@ -438,31 +472,41 @@ do_deb(State, Cfg) ->
     App = safe_get(app, Meta, "unknown_app"),
     Base = join_all([OutDir, "deb", App]),
     ensure_out_dir(Base),
-    Vars = meta_to_vars(Meta),
+
+    %% Base Vars
+    Vars0 = meta_to_vars(Meta),
+
+    %% Resolve Debian fields
+    DebDepends = deb_join(plat_specs(Meta, depends, deb)),
+    DebRecommends = deb_join(plat_specs(Meta, recommends, deb)),
+    DebSuggests = deb_join(plat_specs(Meta, suggests, deb)),
+
+    %% Vars for control.mustache
+    Vars = Vars0#{
+        depends => DebDepends,
+        recommends => DebRecommends,
+        suggests => DebSuggests
+    },
 
     ok = write_file(
         join_all([Base, "DEBIAN", "control"]),
         render_file("deb/control.mustache", Vars)
     ),
+
     Postinst = join_all([Base, "DEBIAN", "postinst"]),
     ok = write_file(Postinst, render_file("deb/postinst.mustache", Vars)),
     ok = file:change_mode(Postinst, 8#755),
 
-    %% collect CLI/config fpm flag and ensure proper install_prefix for runtime
+    %% fpm toggle
     {Args, _} = rebar_state:command_parsed_args(State),
     FpmFlag =
         case proplists:get_value(fpm, Args) of
-            true ->
-                true;
-            false ->
-                false;
-            undefined ->
-                %% fallback to config `{pkg, [{fpm, true}|...]}` or default true
-                proplists:get_value(fpm, Cfg, true)
+            true -> true;
+            false -> false;
+            undefined -> proplists:get_value(fpm, Cfg, true)
         end,
 
-    %% prefer /opt/<app> when bundling a relx release
-    InstallPrefix = proplists:get_value(install_prefix, Meta, filename:join("/opt", App)),
+    InstallPrefix = proplists:get_value(install_prefix, Meta, "/opt"),
 
     FpmMeta = merge_meta(Vars, #{
         fpm => FpmFlag,
@@ -480,14 +524,51 @@ do_arch(State, Cfg) ->
     App = safe_get(app, Meta, "unknown_app"),
     Out = join_all([OutDir, "arch", App]),
     ensure_out_dir(Out),
-    Vars = meta_to_vars(Meta),
-    rebar_api:info("arch ~p", [Vars]),
+
+    %% Base Vars
+    Vars0 = meta_to_vars(Meta),
+
+    %% Resolve Arch fields
+    ArchDependsL = plat_specs(Meta, depends, arch),
+    ArchRecommL = plat_specs(Meta, recommends, arch),
+    ArchSuggestsL = plat_specs(Meta, suggests, arch),
+    rebar_api:info("do arch ~p ~p", [ArchSuggestsL, ArchDependsL]),
+    ArchDepends = arch_array_items(ArchDependsL),
+    ArchOptdepends = arch_array_items(ArchRecommL ++ ArchSuggestsL),
+    rebar_api:info("do arch ~p ~p", [ArchDepends, ArchOptdepends]),
+
+    %% Vars for PKGBUILD.mustache & .install
+    Vars = Vars0#{
+        depends => ArchDepends,
+        optdepends => ArchOptdepends
+    },
+
+    Postinst = join_all([Out, App ++ ".install"]),
+    ok = write_file(Postinst, render_file("arch/pkg.install.mustache", Vars)),
+    ok = file:change_mode(Postinst, 8#755),
 
     ok = write_file(
         join_all([Out, "PKGBUILD"]),
         render_file("arch/PKGBUILD.mustache", Vars)
     ),
-    maybe_fpm(Vars, arch),
+
+    %% fpm toggle
+    {Args, _} = rebar_state:command_parsed_args(State),
+    FpmFlag =
+        case proplists:get_value(fpm, Args) of
+            true -> true;
+            false -> false;
+            undefined -> proplists:get_value(fpm, Cfg, true)
+        end,
+
+    InstallPrefix = proplists:get_value(install_prefix, Meta, "/opt"),
+    FpmMeta = merge_meta(Vars, #{
+        fpm => FpmFlag,
+        after_install => Postinst,
+        install_prefix => InstallPrefix
+    }),
+
+    maybe_fpm(FpmMeta, arch),
     rebar_api:info("arch: wrote ~s", [join_all([Out, "PKGBUILD"])]),
     ok.
 
@@ -523,7 +604,7 @@ maybe_fpm(Meta, Target) ->
         true ->
             App = maps:get(app, Meta),
             % Normalize prefix so we always get /opt/<app>
-            Prefix0 = maps:get(install_prefix, Meta, filename:join("/opt", App)),
+            Prefix0 = maps:get(install_prefix, Meta, "/opt"),
             Prefix1 = strip_trailing_slash(Prefix0),
             Prefix =
                 case filename:basename(Prefix1) of
