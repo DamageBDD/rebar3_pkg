@@ -33,7 +33,7 @@ LogsDirectory={{app}}
 WantedBy=multi-user.target
 EOF
   chmod 0644 "$SERVICE_FILE"
-  chown -R "$USER:$GROUP" "$VAR_DIR" "$LOG_DIR" || true
+  chown -R "{{user}}:{{group}}" "$VAR_DIR" "$LOG_DIR" || true
   # Realize sysusers/tmpfiles we ship with the package
   command -v systemd-sysusers >/dev/null 2>&1 && systemd-sysusers {{app}}.conf
   command -v systemd-tmpfiles >/dev/null 2>&1 && systemd-tmpfiles --create {{app}}.conf
