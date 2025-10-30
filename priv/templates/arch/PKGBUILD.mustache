@@ -28,6 +28,8 @@ package() {
 
   # Use the app name directly instead of $pkgname
   local reltarget="${prefix}"
+  install -d -m0750 "$pkgdir/var/lib/{{app}}"
+  chown {{app}}:{{group}} "$pkgdir/var/lib/{{app}}"
 
   install -d "$pkgdir/$reltarget"
   cp -a "$relsrc/" "$pkgdir/$reltarget/"
@@ -44,17 +46,17 @@ package() {
 
   # sysusers: create group/user and add user to group
   cat >"$pkgdir/usr/lib/sysusers.d/{{app}}.conf" <<'EOF'
-g {{group}} - - - - -
-u {{user}}  - "{{app}} service user" - -
-m {{user}}  {{group}}
+# Create group “damage”
+g {{group}}
+
+# Create system user “damage”, with home and nologin shell
+u {{user}} - "{{app}} service user" /var/lib/{{app}} /usr/bin/nologin
 EOF
 
   # tmpfiles: create runtime/log/config dirs with ownership
   cat >"$pkgdir/usr/lib/tmpfiles.d/{{app}}.conf" <<'EOF'
-d {{var_dir}} 0750 {{user}} {{group}} -
-d {{log_dir}} 0755 {{user}} {{group}} -
-# Optional if you want system-level config dir managed too:
-# d /etc/{{app}} 0755 root root -
+# Ensure runtime/data dirs exist with correct ownership and perms
+d /var/lib/{{app}} 0750 {{app}} {{group}} -
 EOF
 
   # 3) Create standard runtime/config directories
