@@ -499,8 +499,8 @@ do_deb(State, Cfg) ->
     ok = write_file(Postinst, render_file("deb/postinst.mustache", Vars)),
     ok = file:change_mode(Postinst, 8#755),
 
-    %% optional postinst.d (extra scripts)
-    ok = maybe_copy_postinst_d(Meta, Base),
+    %% OPTIONAL: copy postinst.d to release tree so fpm can package it
+    ok = maybe_copy_postinst_d(Meta, Vars),
 
     %% fpm toggle
     {Args, _} = rebar_state:command_parsed_args(State),
@@ -523,6 +523,7 @@ do_deb(State, Cfg) ->
     rebar_api:info("deb: wrote control, postinst~s in ~s",
         [maybe_postinst_d_suffix(Meta), Base]),
     ok.
+
 
 
 do_arch(State, Cfg) ->
@@ -733,26 +734,38 @@ maybe_fpm(Meta, Target) ->
                     {error, fpm_output_unexpected}
             end
     end.
-%% If {postinst_d, Dir} is set in Meta, copy Dir -> Base/DEBIAN/postinst.d
-maybe_copy_postinst_d(Meta, Base) ->
+%% If {postinst_d, Dir} is set in Meta, copy Dir -> <release>/postinst.d
+%% so FPM will include it under ${install_prefix}/${app}/postinst.d
+maybe_copy_postinst_d(Meta, Vars) ->
     case proplists:get_value(postinst_d, Meta) of
         undefined ->
             ok;
         [] ->
             ok;
-        Dir0 ->
-            Dir = normalize(Dir0),
-            case filelib:is_dir(Dir) of
-                true ->
-                    Dest = join_all([Base, "DEBIAN", "postinst.d"]),
-                    ok = filelib:ensure_dir(filename:join(Dest, "placeholder")),
-                    copy_postinst_dir(Dir, Dest);
+        Src0 ->
+            BaseDir = safe_get(base_dir, Meta, "."),
+            SrcRel = normalize(Src0),
+            Src =
+                case filename:pathtype(SrcRel) of
+                    absolute -> SrcRel;
+                    _ -> filename:join(BaseDir, SrcRel)
+                end,
+            case filelib:is_dir(Src) of
                 false ->
                     rebar_api:warn(
                         "deb: postinst_d path ~s is not a directory, skipping",
-                        [Dir]
+                        [Src]
                     ),
-                    ok
+                    ok;
+                true ->
+                    %% RelDir is what maybe_fpm/2 uses as -C <RelDir> .
+                    Bin = maps:get(bin_path, Vars),
+                    BinDir = filename:dirname(Bin),
+                    RelDir = filename:dirname(BinDir),
+
+                    Dest = filename:join(RelDir, "postinst.d"),
+                    ok = filelib:ensure_dir(filename:join(Dest, "placeholder")),
+                    copy_postinst_dir(Src, Dest)
             end
     end.
 
@@ -771,6 +784,7 @@ maybe_postinst_d_suffix(Meta) ->
         [] -> "";
         _ -> " & postinst.d"
     end.
+
 
 target_to_type(arch) -> "pacman";
 target_to_type(rpm) -> "rpm";

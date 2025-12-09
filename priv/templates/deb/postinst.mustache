@@ -37,9 +37,9 @@ export AUTO_START="{{auto_start}}"          # "true" or "false"
 # 1) Optional system hook dir (if you ever stage one)
 # 2) The relx app priv path shipped in the package
 HOOK_DIRS="
-/usr/lib/${APP}/postinst.d
-${PREFIX}/${APP}/DEBIAN/postinst.d
+{{install_prefix}}/{{app}}/postinst.d
 "
+
 
 run_hooks_dir() {
   d="$1"
