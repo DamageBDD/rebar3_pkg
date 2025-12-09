@@ -29,7 +29,6 @@ package() {
   # Use the app name directly instead of $pkgname
   local reltarget="${prefix}"
   install -d -m0750 "$pkgdir/var/lib/{{app}}"
-  chown {{app}}:{{group}} "$pkgdir/var/lib/{{app}}"
 
   install -d "$pkgdir/$reltarget"
   cp -a "$relsrc/" "$pkgdir/$reltarget/"
