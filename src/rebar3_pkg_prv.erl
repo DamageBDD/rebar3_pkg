@@ -742,14 +742,7 @@ maybe_copy_postinst_d(Meta, Vars) ->
             ok;
         [] ->
             ok;
-        Src0 ->
-            BaseDir = safe_get(base_dir, Meta, "."),
-            SrcRel = normalize(Src0),
-            Src =
-                case filename:pathtype(SrcRel) of
-                    absolute -> SrcRel;
-                    _ -> filename:join(BaseDir, SrcRel)
-                end,
+        Src ->
             case filelib:is_dir(Src) of
                 false ->
                     rebar_api:warn(
