@@ -488,14 +488,19 @@ do_deb(State, Cfg) ->
         suggests => DebSuggests
     },
 
+    %% control
     ok = write_file(
         join_all([Base, "DEBIAN", "control"]),
         render_file("deb/control.mustache", Vars)
     ),
 
+    %% main postinst
     Postinst = join_all([Base, "DEBIAN", "postinst"]),
     ok = write_file(Postinst, render_file("deb/postinst.mustache", Vars)),
     ok = file:change_mode(Postinst, 8#755),
+
+    %% optional postinst.d (extra scripts)
+    ok = maybe_copy_postinst_d(Meta, Base),
 
     %% fpm toggle
     {Args, _} = rebar_state:command_parsed_args(State),
@@ -515,8 +520,10 @@ do_deb(State, Cfg) ->
     }),
 
     maybe_fpm(FpmMeta, deb),
-    rebar_api:info("deb: wrote control & postinst in ~s", [Base]),
+    rebar_api:info("deb: wrote control, postinst~s in ~s",
+        [maybe_postinst_d_suffix(Meta), Base]),
     ok.
+
 
 do_arch(State, Cfg) ->
     Meta = project_meta(State, Cfg),
@@ -725,6 +732,44 @@ maybe_fpm(Meta, Target) ->
                     rebar_api:error("fpm: unexpected output. Output:~n~s", [Out]),
                     {error, fpm_output_unexpected}
             end
+    end.
+%% If {postinst_d, Dir} is set in Meta, copy Dir -> Base/DEBIAN/postinst.d
+maybe_copy_postinst_d(Meta, Base) ->
+    case proplists:get_value(postinst_d, Meta) of
+        undefined ->
+            ok;
+        [] ->
+            ok;
+        Dir0 ->
+            Dir = normalize(Dir0),
+            case filelib:is_dir(Dir) of
+                true ->
+                    Dest = join_all([Base, "DEBIAN", "postinst.d"]),
+                    ok = filelib:ensure_dir(filename:join(Dest, "placeholder")),
+                    copy_postinst_dir(Dir, Dest);
+                false ->
+                    rebar_api:warn(
+                        "deb: postinst_d path ~s is not a directory, skipping",
+                        [Dir]
+                    ),
+                    ok
+            end
+    end.
+
+copy_postinst_dir(Src, Dest) ->
+    %% cp -a "$Src/." "$Dest/"
+    Argv = ["cp", "-a", Src ++ "/.", Dest ++ "/"],
+    Cmd = string:join([shell_escape(A) || A <- Argv], " "),
+    rebar_api:info("deb: copying postinst_d via: ~s", [Cmd]),
+    Out = os:cmd(Cmd),
+    rebar_api:info("deb: postinst_d copy output:~n~s", [Out]),
+    ok.
+
+maybe_postinst_d_suffix(Meta) ->
+    case proplists:get_value(postinst_d, Meta) of
+        undefined -> "";
+        [] -> "";
+        _ -> " & postinst.d"
     end.
 
 target_to_type(arch) -> "pacman";
