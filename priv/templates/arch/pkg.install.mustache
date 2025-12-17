@@ -21,7 +21,7 @@ User={{user}}
 Group={{group}}
 Environment=SHELL=sh
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/bin/{{app}} foreground
+ExecStart=${INSTALL_DIR}/bin/{{app}} foreground -config {{etc_dir}}/{{app}}.config
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
