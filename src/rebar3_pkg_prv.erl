@@ -215,13 +215,13 @@ to_list(A) when is_atom(A) -> atom_to_list(A);
 to_list(B) when is_binary(B) -> binary_to_list(B);
 to_list(L) when is_list(L) -> L.
 
-resolve_version(Args, Profile, AppAtom, AppInfo) ->
+resolve_version(Args, Profile, AppAtom, AppInfo, GitDir) ->
     case cli_version(Args) of
         {ok, Vsn0} ->
             rebar_api:info("pkg: version from --version ~s", [Vsn0]),
             Vsn0;
         error ->
-            case git_semver_version() of
+            case git_semver_version(GitDir) of
                 {ok, Vsn1, Tag} ->
                     rebar_api:info("pkg: version from semver git tag ~s -> ~s", [Tag, Vsn1]),
                     Vsn1;
@@ -272,8 +272,8 @@ appinfo_version(AppInfo) ->
 
 %% Prefer an exact semver tag on HEAD over ceremonial/non-version tags.
 %% Accepts v1.2.3 and 1.2.3, including prerelease/build metadata.
-git_semver_version() ->
-    Tags = git_lines("git tag --points-at HEAD"),
+git_semver_version(GitDir) ->
+    Tags = unique_tags(git_head_tags(GitDir) ++ git_head_tags(".")),
     Semvers = lists:append([maybe_semver_tag(T) || T <- Tags]),
     case Semvers of
         [] ->
@@ -283,9 +283,28 @@ git_semver_version() ->
             {ok, Vsn, Tag}
     end.
 
-git_lines(Cmd) ->
+git_head_tags(undefined) -> [];
+git_head_tags([]) -> [];
+git_head_tags(Dir) -> git_lines(["git", "-C", Dir, "tag", "--points-at", "HEAD"]).
+
+git_lines(Argv) ->
+    Cmd = string:join([shell_escape(A) || A <- Argv], " "),
     Out = os:cmd(Cmd ++ " 2>/dev/null"),
     [Line || Line <- [string:trim(L) || L <- string:tokens(Out, "\n")], Line =/= ""].
+
+unique_tags(Tags) ->
+    lists:reverse(
+        lists:foldl(
+            fun(Tag, Acc) ->
+                case lists:member(Tag, Acc) of
+                    true -> Acc;
+                    false -> [Tag | Acc]
+                end
+            end,
+            [],
+            Tags
+        )
+    ).
 
 maybe_semver_tag(Tag0) ->
     case parse_semver_tag(Tag0) of
@@ -502,7 +521,8 @@ project_meta(State, Cfg) ->
             A0 -> find_appinfo(A0, Apps)
         end,
 
-    Version = resolve_version(Args, Profile, AppAtom, AppInfo),
+    BaseDir = rebar_dir:base_dir(State),
+    Version = resolve_version(Args, Profile, AppAtom, AppInfo, BaseDir),
 
     Arch =
         case proplists:get_value(arch, Args) of
@@ -520,7 +540,6 @@ project_meta(State, Cfg) ->
             undefined -> "unknown_app";
             A3 -> atom_to_list(A3)
         end,
-    BaseDir = rebar_dir:base_dir(State),
     AppDetails = rebar_app_info:app_details(AppInfo),
     Maintainer = proplists:get_value(maintainer, AppDetails),
     Links = proplists:get_value(links, AppDetails),
