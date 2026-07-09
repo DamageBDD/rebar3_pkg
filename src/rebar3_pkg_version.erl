@@ -65,8 +65,10 @@ cli_version(Args) ->
 release_or_app_version(AppInfo, ReleaseFun) ->
     case release_version(ReleaseFun) of
         {ok, Vsn0} ->
-            Vsn = to_list(Vsn0),
-            {Vsn, {release, Vsn}};
+            case normalize_semver_vsn(Vsn0) of
+                {ok, Vsn} -> {Vsn, {release, Vsn}};
+                error -> appinfo_version_or_default(AppInfo)
+            end;
         error ->
             appinfo_version_or_default(AppInfo)
     end.
@@ -91,9 +93,14 @@ appinfo_version(AppInfo) ->
     case rebar_app_info:original_vsn(AppInfo) of
         undefined -> error;
         [] -> error;
-        Vsn -> {ok, to_list(Vsn)}
+        Vsn -> normalize_semver_vsn(Vsn)
     end.
 
+normalize_semver_vsn(Vsn0) ->
+    case parse_semver_tag(Vsn0) of
+        {ok, Vsn, _Key} -> {ok, Vsn};
+        error -> error
+    end.
 %% ---------- RELEASES helpers ----------
 
 find_release_vsn([H | T], App) ->
