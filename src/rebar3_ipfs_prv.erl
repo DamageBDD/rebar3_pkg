@@ -35,6 +35,8 @@ opts() ->
     [
         {out, $o, "out", string, "Output dir (default: _build/ipfs)"},
         {profile, $p, "profile", string, "Build profile (default: current)"},
+        {version, $v, "version", string,
+            "Override version (default: semver git tag, RELEASES, app metadata)"},
         {pin, undefined, "pin", boolean, "Pin CIDs after add (default: false)"},
         {ipfs_bin, $b, "ipfs-bin", string, "ipfs binary (default: \"ipfs\")"}
     ].
@@ -85,19 +87,19 @@ project_meta(State) ->
     Profile = proplists:get_value(profile, Args, Profile0),
 
     Apps = rebar_state:project_apps(State),
-    AppName =
+    AppInfo =
         case Apps of
-            [AI | _] -> binary_to_list(rebar_app_info:name(AI));
-            [] -> "unknown_app"
+            [AI0 | _] -> AI0;
+            [] -> undefined
+        end,
+    AppName =
+        case AppInfo of
+            undefined -> "unknown_app";
+            AI -> binary_to_list(rebar_app_info:name(AI))
         end,
     BaseDir = rebar_dir:base_dir(State),
 
-    %% Prefer your RELEASES version logic when available.
-    Vsn =
-        case maybe_release_version(Profile, AppName) of
-            {ok, S} -> S;
-            _ -> "0.0.0"
-        end,
+    Vsn = resolve_version(Args, Profile, AppName, AppInfo),
 
     OutDir =
         case proplists:get_value(out, Args) of
@@ -149,6 +151,247 @@ same_name(Name, App) when is_list(Name) -> Name =:= App.
 to_list(A) when is_atom(A) -> atom_to_list(A);
 to_list(B) when is_binary(B) -> binary_to_list(B);
 to_list(L) when is_list(L) -> L.
+
+resolve_version(Args, Profile, AppName, AppInfo) ->
+    case cli_version(Args) of
+        {ok, Vsn0} ->
+            rebar_api:info("ipfs: version from --version ~s", [Vsn0]),
+            Vsn0;
+        error ->
+            case git_semver_version() of
+                {ok, Vsn1, Tag} ->
+                    rebar_api:info("ipfs: version from semver git tag ~s -> ~s", [Tag, Vsn1]),
+                    Vsn1;
+                error ->
+                    release_or_app_version(Profile, AppName, AppInfo)
+            end
+    end.
+
+cli_version(Args) ->
+    case proplists:get_value(version, Args) of
+        undefined -> error;
+        [] -> error;
+        V -> {ok, to_list(V)}
+    end.
+
+release_or_app_version(Profile, AppName, AppInfo) ->
+    case maybe_release_version(Profile, AppName) of
+        {ok, Vsn} ->
+            rebar_api:info("ipfs: version from RELEASES ~s", [Vsn]),
+            Vsn;
+        _ ->
+            appinfo_version_or_default(AppInfo)
+    end.
+
+appinfo_version_or_default(AppInfo) ->
+    case appinfo_version(AppInfo) of
+        {ok, Vsn} ->
+            rebar_api:info("ipfs: version from app metadata ~s", [Vsn]),
+            Vsn;
+        error ->
+            rebar_api:warn("ipfs: no version found; using 0.0.0", []),
+            "0.0.0"
+    end.
+
+appinfo_version(undefined) ->
+    error;
+appinfo_version(AppInfo) ->
+    case rebar_app_info:original_vsn(AppInfo) of
+        undefined -> error;
+        [] -> error;
+        Vsn -> {ok, to_list(Vsn)}
+    end.
+
+%% Prefer an exact semver tag on HEAD over ceremonial/non-version tags.
+%% Accepts v1.2.3 and 1.2.3, including prerelease/build metadata.
+git_semver_version() ->
+    Tags = git_lines("git tag --points-at HEAD"),
+    Semvers = lists:append([maybe_semver_tag(T) || T <- Tags]),
+    case Semvers of
+        [] ->
+            error;
+        _ ->
+            {Vsn, Tag, _Key} = pick_highest_semver(Semvers),
+            {ok, Vsn, Tag}
+    end.
+
+git_lines(Cmd) ->
+    Out = os:cmd(Cmd ++ " 2>/dev/null"),
+    [Line || Line <- [string:trim(L) || L <- string:tokens(Out, "\n")], Line =/= ""].
+
+maybe_semver_tag(Tag0) ->
+    case parse_semver_tag(Tag0) of
+        {ok, Vsn, Key} -> [{Vsn, tag_name(Tag0), Key}];
+        error -> []
+    end.
+
+pick_highest_semver([H | T]) ->
+    lists:foldl(
+        fun({_, _, Key} = Candidate, {_, _, BestKey} = Best) ->
+            case semver_compare(Key, BestKey) of
+                gt -> Candidate;
+                _ -> Best
+            end
+        end,
+        H,
+        T
+    ).
+
+parse_semver_tag(Tag0) ->
+    Tag = strip_v_prefix(tag_name(Tag0)),
+    {Core, Build} = split_once(Tag, $+),
+    case valid_build(Build) of
+        true ->
+            {Base, Pre} = split_once(Core, $-),
+            case valid_core_base(Base) of
+                true ->
+                    case string:tokens(Base, ".") of
+                        [MajS, MinS, PatchS] ->
+                            case
+                                {
+                                    parse_core_num(MajS),
+                                    parse_core_num(MinS),
+                                    parse_core_num(PatchS),
+                                    parse_pre(Pre)
+                                }
+                            of
+                                {{ok, Maj}, {ok, Min}, {ok, Patch}, {ok, PreKey}} ->
+                                    {ok, Tag, {Maj, Min, Patch, PreKey}};
+                                _ ->
+                                    error
+                            end;
+                        _ ->
+                            error
+                    end;
+                false ->
+                    error
+            end;
+        false ->
+            error
+    end.
+
+tag_name(Tag0) ->
+    Tag = string:trim(to_list(Tag0)),
+    Prefix = "refs/tags/",
+    case lists:prefix(Prefix, Tag) of
+        true -> string:substr(Tag, length(Prefix) + 1);
+        false -> Tag
+    end.
+
+strip_v_prefix([$v | T]) -> T;
+strip_v_prefix([$V | T]) -> T;
+strip_v_prefix(S) -> S.
+
+split_once(S, Char) ->
+    case string:chr(S, Char) of
+        0 -> {S, none};
+        N -> {string:substr(S, 1, N - 1), string:substr(S, N + 1)}
+    end.
+
+parse_core_num(S) ->
+    case valid_core_num(S) of
+        true -> {ok, list_to_integer(S)};
+        false -> error
+    end.
+
+valid_core_base(S) ->
+    S =/= "" andalso
+        not lists:prefix(".", S) andalso
+        not lists:suffix(".", S) andalso
+        string:str(S, "..") =:= 0.
+
+valid_core_num("0") -> true;
+valid_core_num([H | _] = S) -> H >= $1 andalso H =< $9 andalso all_digits(S);
+valid_core_num(_) -> false.
+
+parse_pre(none) ->
+    {ok, release};
+parse_pre(Pre) ->
+    case valid_ident_list(Pre, true) of
+        true -> {ok, [pre_ident(I) || I <- string:tokens(Pre, ".")]};
+        false -> error
+    end.
+
+valid_build(none) -> true;
+valid_build(Build) -> valid_ident_list(Build, false).
+
+valid_ident_list(S, CheckNumericLeadingZero) ->
+    S =/= "" andalso
+        not lists:prefix(".", S) andalso
+        not lists:suffix(".", S) andalso
+        string:str(S, "..") =:= 0 andalso
+        lists:all(fun(I) -> valid_ident(I, CheckNumericLeadingZero) end, string:tokens(S, ".")).
+
+valid_ident(S, CheckNumericLeadingZero) ->
+    valid_ident_chars(S) andalso
+        case {CheckNumericLeadingZero, all_digits(S)} of
+            {true, true} -> valid_core_num(S);
+            _ -> true
+        end.
+
+valid_ident_chars(S) ->
+    S =/= "" andalso
+        lists:all(
+            fun(C) ->
+                (C >= $0 andalso C =< $9) orelse
+                    (C >= $A andalso C =< $Z) orelse
+                    (C >= $a andalso C =< $z) orelse
+                    C =:= $-
+            end,
+            S
+        ).
+
+all_digits(S) ->
+    S =/= "" andalso lists:all(fun(C) -> C >= $0 andalso C =< $9 end, S).
+
+pre_ident(S) ->
+    case all_digits(S) of
+        true -> {num, list_to_integer(S)};
+        false -> {str, S}
+    end.
+
+semver_compare({MajA, MinA, PatchA, PreA}, {MajB, MinB, PatchB, PreB}) ->
+    case compare_nums([MajA, MinA, PatchA], [MajB, MinB, PatchB]) of
+        eq -> compare_pre(PreA, PreB);
+        Other -> Other
+    end.
+
+compare_nums([A | As], [B | Bs]) ->
+    case compare_int(A, B) of
+        eq -> compare_nums(As, Bs);
+        Other -> Other
+    end;
+compare_nums([], []) ->
+    eq.
+
+compare_int(A, B) when A > B -> gt;
+compare_int(A, B) when A < B -> lt;
+compare_int(_, _) -> eq.
+
+compare_pre(release, release) ->
+    eq;
+compare_pre(release, _) ->
+    gt;
+compare_pre(_, release) ->
+    lt;
+compare_pre([], []) ->
+    eq;
+compare_pre([], [_ | _]) ->
+    lt;
+compare_pre([_ | _], []) ->
+    gt;
+compare_pre([A | As], [B | Bs]) ->
+    case compare_pre_ident(A, B) of
+        eq -> compare_pre(As, Bs);
+        Other -> Other
+    end.
+
+compare_pre_ident({num, A}, {num, B}) -> compare_int(A, B);
+compare_pre_ident({num, _}, {str, _}) -> lt;
+compare_pre_ident({str, _}, {num, _}) -> gt;
+compare_pre_ident({str, A}, {str, B}) when A > B -> gt;
+compare_pre_ident({str, A}, {str, B}) when A < B -> lt;
+compare_pre_ident(_, _) -> eq.
 
 %% ---------- Filesystem + IPFS ----------
 

@@ -183,17 +183,283 @@ release_version(Profile0, App0) ->
     File = filename:join(["_build", Profile, "rel", AppName, "releases", "RELEASES"]),
     rebar_api:info("RELEASE file ~p", [File]),
     case file:consult(File) of
-        {ok, [[{release, AppName, Version, _ErtsVsn, _Apps, permanent}]]} ->
-            {ok, Version};
+        {ok, [Terms]} ->
+            case find_release_vsn(Terms, AppName) of
+                undefined -> {error, not_found};
+                Version -> {ok, to_list(Version)}
+            end;
         Error ->
             Error
     end.
+
+find_release_vsn([H | T], App) ->
+    case H of
+        {release, Name, Vsn, _ErtsVsn, _Apps, permanent} ->
+            case same_name(Name, App) of
+                true -> Vsn;
+                false -> find_release_vsn(T, App)
+            end;
+        _ ->
+            find_release_vsn(T, App)
+    end;
+find_release_vsn([], _) ->
+    undefined.
+
+same_name(Name, App) when is_atom(Name) -> atom_to_list(Name) =:= to_list(App);
+same_name(Name, App) when is_binary(Name) -> binary_to_list(Name) =:= to_list(App);
+same_name(Name, App) when is_list(Name) -> Name =:= to_list(App).
 
 %% ---- helpers ----
 
 to_list(A) when is_atom(A) -> atom_to_list(A);
 to_list(B) when is_binary(B) -> binary_to_list(B);
 to_list(L) when is_list(L) -> L.
+
+resolve_version(Args, Profile, AppAtom, AppInfo) ->
+    case cli_version(Args) of
+        {ok, Vsn0} ->
+            rebar_api:info("pkg: version from --version ~s", [Vsn0]),
+            Vsn0;
+        error ->
+            case git_semver_version() of
+                {ok, Vsn1, Tag} ->
+                    rebar_api:info("pkg: version from semver git tag ~s -> ~s", [Tag, Vsn1]),
+                    Vsn1;
+                error ->
+                    release_or_app_version(Profile, AppAtom, AppInfo)
+            end
+    end.
+
+cli_version(Args) ->
+    case proplists:get_value(version, Args) of
+        undefined -> error;
+        [] -> error;
+        V -> {ok, to_list(V)}
+    end.
+
+release_or_app_version(Profile, AppAtom, AppInfo) ->
+    case AppAtom of
+        undefined ->
+            appinfo_version_or_default(AppInfo);
+        A1 ->
+            case release_version(Profile, A1) of
+                {ok, Vsn} ->
+                    rebar_api:info("pkg: version from RELEASES ~s", [Vsn]),
+                    Vsn;
+                _ ->
+                    appinfo_version_or_default(AppInfo)
+            end
+    end.
+
+appinfo_version_or_default(AppInfo) ->
+    case appinfo_version(AppInfo) of
+        {ok, Vsn} ->
+            rebar_api:info("pkg: version from app metadata ~s", [Vsn]),
+            Vsn;
+        error ->
+            rebar_api:warn("pkg: no version found; using 0.0.0", []),
+            "0.0.0"
+    end.
+
+appinfo_version(undefined) ->
+    error;
+appinfo_version(AppInfo) ->
+    case rebar_app_info:original_vsn(AppInfo) of
+        undefined -> error;
+        [] -> error;
+        Vsn -> {ok, to_list(Vsn)}
+    end.
+
+%% Prefer an exact semver tag on HEAD over ceremonial/non-version tags.
+%% Accepts v1.2.3 and 1.2.3, including prerelease/build metadata.
+git_semver_version() ->
+    Tags = git_lines("git tag --points-at HEAD"),
+    Semvers = lists:append([maybe_semver_tag(T) || T <- Tags]),
+    case Semvers of
+        [] ->
+            error;
+        _ ->
+            {Vsn, Tag, _Key} = pick_highest_semver(Semvers),
+            {ok, Vsn, Tag}
+    end.
+
+git_lines(Cmd) ->
+    Out = os:cmd(Cmd ++ " 2>/dev/null"),
+    [Line || Line <- [string:trim(L) || L <- string:tokens(Out, "\n")], Line =/= ""].
+
+maybe_semver_tag(Tag0) ->
+    case parse_semver_tag(Tag0) of
+        {ok, Vsn, Key} -> [{Vsn, tag_name(Tag0), Key}];
+        error -> []
+    end.
+
+pick_highest_semver([H | T]) ->
+    lists:foldl(
+        fun({_, _, Key} = Candidate, {_, _, BestKey} = Best) ->
+            case semver_compare(Key, BestKey) of
+                gt -> Candidate;
+                _ -> Best
+            end
+        end,
+        H,
+        T
+    ).
+
+parse_semver_tag(Tag0) ->
+    Tag = strip_v_prefix(tag_name(Tag0)),
+    {Core, Build} = split_once(Tag, $+),
+    case valid_build(Build) of
+        true ->
+            {Base, Pre} = split_once(Core, $-),
+            case valid_core_base(Base) of
+                true ->
+                    case string:tokens(Base, ".") of
+                        [MajS, MinS, PatchS] ->
+                            case
+                                {
+                                    parse_core_num(MajS),
+                                    parse_core_num(MinS),
+                                    parse_core_num(PatchS),
+                                    parse_pre(Pre)
+                                }
+                            of
+                                {{ok, Maj}, {ok, Min}, {ok, Patch}, {ok, PreKey}} ->
+                                    {ok, Tag, {Maj, Min, Patch, PreKey}};
+                                _ ->
+                                    error
+                            end;
+                        _ ->
+                            error
+                    end;
+                false ->
+                    error
+            end;
+        false ->
+            error
+    end.
+
+tag_name(Tag0) ->
+    Tag = string:trim(to_list(Tag0)),
+    Prefix = "refs/tags/",
+    case lists:prefix(Prefix, Tag) of
+        true -> string:substr(Tag, length(Prefix) + 1);
+        false -> Tag
+    end.
+
+strip_v_prefix([$v | T]) -> T;
+strip_v_prefix([$V | T]) -> T;
+strip_v_prefix(S) -> S.
+
+split_once(S, Char) ->
+    case string:chr(S, Char) of
+        0 -> {S, none};
+        N -> {string:substr(S, 1, N - 1), string:substr(S, N + 1)}
+    end.
+
+parse_core_num(S) ->
+    case valid_core_num(S) of
+        true -> {ok, list_to_integer(S)};
+        false -> error
+    end.
+
+valid_core_base(S) ->
+    S =/= "" andalso
+        not lists:prefix(".", S) andalso
+        not lists:suffix(".", S) andalso
+        string:str(S, "..") =:= 0.
+
+valid_core_num("0") -> true;
+valid_core_num([H | _] = S) -> H >= $1 andalso H =< $9 andalso all_digits(S);
+valid_core_num(_) -> false.
+
+parse_pre(none) ->
+    {ok, release};
+parse_pre(Pre) ->
+    case valid_ident_list(Pre, true) of
+        true -> {ok, [pre_ident(I) || I <- string:tokens(Pre, ".")]};
+        false -> error
+    end.
+
+valid_build(none) -> true;
+valid_build(Build) -> valid_ident_list(Build, false).
+
+valid_ident_list(S, CheckNumericLeadingZero) ->
+    S =/= "" andalso
+        not lists:prefix(".", S) andalso
+        not lists:suffix(".", S) andalso
+        string:str(S, "..") =:= 0 andalso
+        lists:all(fun(I) -> valid_ident(I, CheckNumericLeadingZero) end, string:tokens(S, ".")).
+
+valid_ident(S, CheckNumericLeadingZero) ->
+    valid_ident_chars(S) andalso
+        case {CheckNumericLeadingZero, all_digits(S)} of
+            {true, true} -> valid_core_num(S);
+            _ -> true
+        end.
+
+valid_ident_chars(S) ->
+    S =/= "" andalso
+        lists:all(
+            fun(C) ->
+                (C >= $0 andalso C =< $9) orelse
+                    (C >= $A andalso C =< $Z) orelse
+                    (C >= $a andalso C =< $z) orelse
+                    C =:= $-
+            end,
+            S
+        ).
+
+all_digits(S) ->
+    S =/= "" andalso lists:all(fun(C) -> C >= $0 andalso C =< $9 end, S).
+
+pre_ident(S) ->
+    case all_digits(S) of
+        true -> {num, list_to_integer(S)};
+        false -> {str, S}
+    end.
+
+semver_compare({MajA, MinA, PatchA, PreA}, {MajB, MinB, PatchB, PreB}) ->
+    case compare_nums([MajA, MinA, PatchA], [MajB, MinB, PatchB]) of
+        eq -> compare_pre(PreA, PreB);
+        Other -> Other
+    end.
+
+compare_nums([A | As], [B | Bs]) ->
+    case compare_int(A, B) of
+        eq -> compare_nums(As, Bs);
+        Other -> Other
+    end;
+compare_nums([], []) ->
+    eq.
+
+compare_int(A, B) when A > B -> gt;
+compare_int(A, B) when A < B -> lt;
+compare_int(_, _) -> eq.
+
+compare_pre(release, release) ->
+    eq;
+compare_pre(release, _) ->
+    gt;
+compare_pre(_, release) ->
+    lt;
+compare_pre([], []) ->
+    eq;
+compare_pre([], [_ | _]) ->
+    lt;
+compare_pre([_ | _], []) ->
+    gt;
+compare_pre([A | As], [B | Bs]) ->
+    case compare_pre_ident(A, B) of
+        eq -> compare_pre(As, Bs);
+        Other -> Other
+    end.
+
+compare_pre_ident({num, A}, {num, B}) -> compare_int(A, B);
+compare_pre_ident({num, _}, {str, _}) -> lt;
+compare_pre_ident({str, _}, {num, _}) -> gt;
+compare_pre_ident({str, A}, {str, B}) when A > B -> gt;
+compare_pre_ident({str, A}, {str, B}) when A < B -> lt;
+compare_pre_ident(_, _) -> eq.
 
 project_meta(State, Cfg) ->
     {Args, _} = rebar_state:command_parsed_args(State),
@@ -236,16 +502,7 @@ project_meta(State, Cfg) ->
             A0 -> find_appinfo(A0, Apps)
         end,
 
-    Version =
-        case AppAtom of
-            undefined ->
-                rebar_api:info("Arg Version ~p", [Args]),
-                proplists:get_value(version, Args, "0.0.0");
-            A1 ->
-                {ok, Vsn} = release_version(Profile, A1),
-                rebar_api:info("Release Version ~p", [Vsn]),
-                Vsn
-        end,
+    Version = resolve_version(Args, Profile, AppAtom, AppInfo),
 
     Arch =
         case proplists:get_value(arch, Args) of
@@ -520,11 +777,11 @@ do_deb(State, Cfg) ->
     }),
 
     maybe_fpm(FpmMeta, deb),
-    rebar_api:info("deb: wrote control, postinst~s in ~s",
-        [maybe_postinst_d_suffix(Meta), Base]),
+    rebar_api:info(
+        "deb: wrote control, postinst~s in ~s",
+        [maybe_postinst_d_suffix(Meta), Base]
+    ),
     ok.
-
-
 
 do_arch(State, Cfg) ->
     Meta = project_meta(State, Cfg),
@@ -718,14 +975,20 @@ maybe_fpm(Meta, Target) ->
             case IsExit of
                 true ->
                     CodeStr = string:substr(ExitLine, 6),
-                    case (catch list_to_integer(CodeStr)) of
-                        0 ->
+                    ExitCode =
+                        try
+                            {ok, list_to_integer(CodeStr)}
+                        catch
+                            error:badarg -> error
+                        end,
+                    case ExitCode of
+                        {ok, 0} ->
                             rebar_api:info("fpm: wrote package(s) under ~s", [TargetDir]),
                             ok;
-                        N when is_integer(N) ->
+                        {ok, N} when is_integer(N) ->
                             rebar_api:error("fpm failed (exit ~p). Output:~n~s", [N, Out]),
                             {error, {fpm_failed, N}};
-                        _ ->
+                        error ->
                             rebar_api:error("fpm: could not parse exit code. Output:~n~s", [Out]),
                             {error, fpm_exit_unknown}
                     end;
@@ -777,7 +1040,6 @@ maybe_postinst_d_suffix(Meta) ->
         [] -> "";
         _ -> " & postinst.d"
     end.
-
 
 target_to_type(arch) -> "pacman";
 target_to_type(rpm) -> "rpm";
