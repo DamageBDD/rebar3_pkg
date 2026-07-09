@@ -8,6 +8,9 @@
     git_dir/1,
     git_head_tags/1,
     git_semver_version/1,
+    git_describe_semver_version/1,
+    bumped_semver_from_describe/1,
+    bump_build_version/3,
     semver_tags/1,
     parse_semver_tag/1,
     maybe_semver_tag/1,
@@ -17,7 +20,8 @@
 ]).
 
 %% Resolve precedence:
-%%   --version -> semver tag on HEAD -> RELEASES -> app metadata -> 0.0.0
+%%   --version -> exact semver tag on HEAD -> bumped previous semver tag ->
+%%   semver RELEASES -> semver app metadata -> 0.0.0
 resolve(Args, BaseDir, AppInfo, ReleaseFun) ->
     case cli_version(Args) of
         {ok, Vsn0} ->
@@ -27,7 +31,12 @@ resolve(Args, BaseDir, AppInfo, ReleaseFun) ->
                 {ok, Vsn1, Tag} ->
                     {Vsn1, {git, Tag, Vsn1}};
                 error ->
-                    release_or_app_version(AppInfo, ReleaseFun)
+                    case git_describe_semver_version(BaseDir) of
+                        {ok, Vsn2, Tag2, Count, Ref} ->
+                            {Vsn2, {git_bump, Tag2, Count, Ref, Vsn2}};
+                        error ->
+                            release_or_app_version(AppInfo, ReleaseFun)
+                    end
             end
     end.
 
@@ -48,6 +57,11 @@ log_source(Prefix, {cli, Vsn}) ->
     rebar_api:info("~s: version from --version ~s", [Prefix, Vsn]);
 log_source(Prefix, {git, Tag, Vsn}) ->
     rebar_api:info("~s: version from semver git tag ~s -> ~s", [Prefix, Tag, Vsn]);
+log_source(Prefix, {git_bump, Tag, Count, Ref, Vsn}) ->
+    rebar_api:info(
+        "~s: version from previous semver git tag ~s + ~p commits ref~s -> ~s",
+        [Prefix, Tag, Count, Ref, Vsn]
+    );
 log_source(Prefix, {release, Vsn}) ->
     rebar_api:info("~s: version from RELEASES ~s", [Prefix, Vsn]);
 log_source(Prefix, {app, Vsn}) ->
@@ -101,6 +115,7 @@ normalize_semver_vsn(Vsn0) ->
         {ok, Vsn, _Key} -> {ok, Vsn};
         error -> error
     end.
+
 %% ---------- RELEASES helpers ----------
 
 find_release_vsn([H | T], App) ->
@@ -145,6 +160,102 @@ git_semver_version(BaseDir) ->
             {Vsn, Tag, _Key} = pick_highest_semver(Semvers),
             {ok, Vsn, Tag}
     end.
+
+git_describe_semver_version(BaseDir) ->
+    case first_git_describe_line(BaseDir) of
+        {ok, Describe} -> bumped_semver_from_describe(Describe);
+        error -> error
+    end.
+
+first_git_describe_line(BaseDir) ->
+    Dirs = unique_paths([git_dir(BaseDir), project_root(BaseDir), normalize_dir(BaseDir), "."]),
+    first_git_describe_line1(Dirs).
+
+first_git_describe_line1([Dir | Rest]) ->
+    case git_describe_lines(Dir) of
+        [Describe | _] -> {ok, Describe};
+        [] -> first_git_describe_line1(Rest)
+    end;
+first_git_describe_line1([]) ->
+    error.
+
+git_describe_lines(Dir) ->
+    git_lines([
+        "git",
+        "-C",
+        Dir,
+        "describe",
+        "--tags",
+        "--long",
+        "--abbrev=7",
+        "--match",
+        "v[0-9]*.[0-9]*.[0-9]*",
+        "--match",
+        "[0-9]*.[0-9]*.[0-9]*",
+        "HEAD"
+    ]).
+
+bumped_semver_from_describe(Describe0) ->
+    case split_describe(to_list(Describe0)) of
+        {ok, Tag, Count, Ref} ->
+            case parse_semver_tag(Tag) of
+                {ok, TagVsn, _Key} ->
+                    Vsn =
+                        case Count of
+                            0 -> TagVsn;
+                            _ -> bump_build_version(TagVsn, Count, Ref)
+                        end,
+                    {ok, Vsn, Tag, Count, Ref};
+                error ->
+                    error
+            end;
+        error ->
+            error
+    end.
+
+split_describe(S) ->
+    case split_last(S, $-) of
+        {TagAndCount, [$g | Ref]} ->
+            case split_last(TagAndCount, $-) of
+                {Tag, CountS} ->
+                    case parse_non_negative_int(CountS) of
+                        {ok, Count} -> {ok, Tag, Count, Ref};
+                        error -> error
+                    end;
+                error ->
+                    error
+            end;
+        _ ->
+            error
+    end.
+
+split_last(S, Char) ->
+    Rev = lists:reverse(S),
+    case string:chr(Rev, Char) of
+        0 ->
+            error;
+        N ->
+            RightRev = lists:sublist(Rev, 1, N - 1),
+            LeftRev = lists:nthtail(N, Rev),
+            {lists:reverse(LeftRev), lists:reverse(RightRev)}
+    end.
+
+parse_non_negative_int(S) ->
+    try list_to_integer(S) of
+        N when N >= 0 -> {ok, N};
+        _ -> error
+    catch
+        error:badarg -> error
+    end.
+
+bump_build_version(Vsn0, Count, Ref0) ->
+    Vsn = to_list(Vsn0),
+    Ref = strip_g_prefix(to_list(Ref0)),
+    {Base, _OldBuild} = split_once(Vsn, $+),
+    Base ++ "+build." ++ integer_to_list(Count) ++ ".ref" ++ Ref.
+
+strip_g_prefix([$g | T]) -> T;
+strip_g_prefix(S) -> S.
 
 semver_tags(Tags) ->
     [Tag || {_Vsn, Tag, _Key} <- lists:append([maybe_semver_tag(T) || T <- Tags])].
@@ -208,7 +319,13 @@ shell_escape(S) when is_list(S) ->
     NeedsQuoting =
         lists:any(
             fun(C) ->
-                (C =< 32) orelse (C =:= $") orelse (C =:= $\')
+                (C =< 32) orelse
+                    (C =:= $") orelse
+                    (C =:= $\') orelse
+                    (C =:= $*) orelse
+                    (C =:= $?) orelse
+                    (C =:= $[) orelse
+                    (C =:= $])
             end,
             S
         ),

@@ -31,6 +31,18 @@ compare_prerelease_identifiers_test() ->
     ]),
     ?assertMatch({"1.7.0-rc.10", "v1.7.0-rc.10", _}, rebar3_pkg_version:pick_highest_semver(Semvers)).
 
+bumped_describe_version_test() ->
+    ?assertEqual(
+        {ok, "1.7.0-rc1+build.3.ref747756e", "v1.7.0-rc1", 3, "747756e"},
+        rebar3_pkg_version:bumped_semver_from_describe("v1.7.0-rc1-3-g747756e")
+    ).
+
+bumped_describe_replaces_existing_build_metadata_test() ->
+    ?assertEqual(
+        "1.7.0+build.2.refabcdef0",
+        rebar3_pkg_version:bump_build_version("1.7.0+old.meta", 2, "gabcdef0")
+    ).
+
 project_root_from_rebar_build_dir_test() ->
     RawRoot = filename:absname("."),
     Root = normalize_path(RawRoot),
