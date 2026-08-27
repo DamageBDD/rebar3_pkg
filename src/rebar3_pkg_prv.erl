@@ -275,6 +275,7 @@ project_meta(State, Cfg) ->
 
     {AppAtom, AppInfo, AppName} = project_app(State, Profile),
     BaseDir = rebar_dir:base_dir(State),
+    AppDir = resolve_app_dir(AppInfo, BaseDir, AppName),
     Version = resolve_version(Args, Profile, AppAtom, AppInfo, BaseDir),
 
     Arch =
@@ -312,6 +313,7 @@ project_meta(State, Cfg) ->
         {profile, Profile},
         {description, Description},
         {base_dir, BaseDir},
+        {app_dir, AppDir},
         {links, Links},
         {licenses, Licenses}
     ] ++ Cfg.
@@ -334,10 +336,11 @@ meta_to_vars(Meta) ->
         group => proplists:get_value(group, Meta, App),
         bin_path => bin_path(Meta),
         base_dir => proplists:get_value(base_dir, Meta),
+        app_dir => proplists:get_value(app_dir, Meta),
         etc_dir => proplists:get_value(etc_dir, Meta, "/etc/" ++ App),
         var_dir => proplists:get_value(var_dir, Meta, "/var/lib/" ++ App),
         log_dir => proplists:get_value(log_dir, Meta, "/var/log/" ++ App),
-        systemd_unit => proplists:get_value(systemd_unit, Meta, ""),
+        systemd_unit => systemd_unit_path(Meta),
         unit_wants => proplists:get_value(unit_wants, Meta, "network-online.target"),
         out_dir => proplists:get_value(out_dir, Meta, "_build/pkg"),
         auto_start => proplists:get_value(auto_start, Meta, "true"),
@@ -351,6 +354,34 @@ meta_to_vars(Meta) ->
             rebar3_url, Meta, "https://s3.amazonaws.com/rebar3/rebar3"
         )
     }.
+
+resolve_app_dir(undefined, BaseDir, AppName) ->
+    UmbrellaDir = filename:join([BaseDir, "apps", AppName]),
+    case filelib:is_dir(UmbrellaDir) of
+        true -> UmbrellaDir;
+        false -> BaseDir
+    end;
+resolve_app_dir(AppInfo, BaseDir, AppName) ->
+    try rebar_app_info:dir(AppInfo) of
+        Dir when is_list(Dir), Dir =/= [] -> Dir;
+        Dir when is_binary(Dir), Dir =/= <<>> -> binary_to_list(Dir);
+        _ -> resolve_app_dir(undefined, BaseDir, AppName)
+    catch
+        _:_ -> resolve_app_dir(undefined, BaseDir, AppName)
+    end.
+
+systemd_unit_path(Meta) ->
+    case proplists:get_value(systemd_unit, Meta) of
+        undefined -> default_systemd_unit_path(Meta);
+        [] -> default_systemd_unit_path(Meta);
+        Unit -> normalize(Unit)
+    end.
+
+default_systemd_unit_path(Meta) ->
+    App = safe_get(app, Meta, "app"),
+    BaseDir = safe_get(base_dir, Meta, "."),
+    AppDir = safe_get(app_dir, Meta, filename:join([BaseDir, "apps", App])),
+    filename:join([AppDir, "priv", "pkg", App ++ ".service"]).
 
 default_arch() ->
     case os:type() of
@@ -685,8 +716,6 @@ maybe_fpm(Meta, Target) ->
                 Version,
                 "-a",
                 Arch,
-                "--prefix",
-                Prefix,
                 "-p",
                 OutArg,
                 "--force"
@@ -722,7 +751,8 @@ maybe_fpm(Meta, Target) ->
                     )
                 ),
 
-            Argv = BaseArgs ++ OptMeta ++ ScriptMeta ++ ["-C", RelDir, "."],
+            Inputs = fpm_inputs(Meta, RelDir, Prefix),
+            Argv = BaseArgs ++ OptMeta ++ ScriptMeta ++ Inputs,
             Cmd = string:join([shell_escape(A) || A <- Argv], " "),
 
             rebar_api:info("fpm cmd: ~s", [Cmd]),
@@ -764,6 +794,38 @@ maybe_fpm(Meta, Target) ->
                     {error, fpm_output_unexpected}
             end
     end.
+
+%% Package the release and systemd unit from one canonical source for every
+%% target. Explicit source=destination mappings avoid --prefix incorrectly
+%% placing /etc/systemd/system below the application prefix.
+fpm_inputs(Meta, RelDir0, Prefix) ->
+    RelDir = filename:absname(RelDir0),
+    App = normalize(maps:get(app, Meta)),
+    ServiceName = normalize(maps:get(service_name, Meta, App)),
+    AppDir = normalize(maps:get(app_dir, Meta, ".")),
+    SystemdUnit0 = normalize(
+        maps:get(
+            systemd_unit,
+            Meta,
+            filename:join([AppDir, "priv", "pkg", App ++ ".service"])
+        )
+    ),
+    SystemdUnit = filename:absname(SystemdUnit0),
+    case filelib:is_regular(SystemdUnit) of
+        true ->
+            ok;
+        false ->
+            error({systemd_unit_not_found, SystemdUnit})
+    end,
+    ServiceDest = filename:join([
+        "/etc/systemd/system",
+        ServiceName ++ ".service"
+    ]),
+    [
+        RelDir ++ "/=" ++ Prefix,
+        SystemdUnit ++ "=" ++ ServiceDest
+    ].
+
 %% If {postinst_d, Dir} is set in Meta, copy Dir -> <release>/postinst.d
 %% so FPM will include it under ${install_prefix}/${app}/postinst.d
 maybe_copy_postinst_d(Meta, Vars) ->
