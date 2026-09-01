@@ -344,6 +344,7 @@ meta_to_vars(Meta) ->
         unit_wants => proplists:get_value(unit_wants, Meta, "network-online.target"),
         out_dir => proplists:get_value(out_dir, Meta, "_build/pkg"),
         auto_start => proplists:get_value(auto_start, Meta, "true"),
+        postinst_d => proplists:get_value(postinst_d, Meta, undefined),
 
         depends => proplists:get_value(depends, Meta, ""),
         recommends => proplists:get_value(recommends, Meta, ""),
@@ -519,6 +520,102 @@ deb_join(L) -> string:join(L, ", ").
 arch_array_items([]) -> "";
 arch_array_items(L) -> "('" ++ string:join(L, "' '") ++ "')".
 
+%% Resolve the final application install directory exactly once so the FPM
+%% payload and the common after-install runner agree on the same path.
+package_install_dir(Meta) ->
+    App = normalize(maps:get(app, Meta)),
+    Prefix0 = normalize(maps:get(install_prefix, Meta, "/opt")),
+    Prefix1 = strip_trailing_slash(Prefix0),
+    case filename:basename(Prefix1) of
+        App -> Prefix1;
+        _ -> filename:join(Prefix1, App)
+    end.
+
+%% FPM accepts a normal shell script for --after-install and adapts it to the
+%% target package format. Generate one common runner for deb/rpm/pacman rather
+%% than maintaining distro-specific lifecycle behavior.
+write_fpm_postinst(OutDir, Vars) ->
+    Path = join_all([OutDir, "fpm-postinstall.sh"]),
+    ok = write_file(Path, fpm_postinst_script(Vars)),
+    ok = file:change_mode(Path, 8#755),
+    Path.
+
+fpm_postinst_script(Vars) ->
+    App = normalize(maps:get(app, Vars)),
+    InstallDir = package_install_dir(Vars),
+    Prefix = filename:dirname(InstallDir),
+    Bin = filename:join([InstallDir, "bin", App]),
+    Link = filename:join(["/usr/bin", App]),
+    EtcDir = normalize(maps:get(etc_dir, Vars, "/etc/" ++ App)),
+    VarDir = normalize(maps:get(var_dir, Vars, "/var/lib/" ++ App)),
+    LogDir = normalize(maps:get(log_dir, Vars, "/var/log/" ++ App)),
+    CreateUser = normalize(maps:get(create_user, Vars, "true")),
+    User = normalize(maps:get(user, Vars, App)),
+    Group = normalize(maps:get(group, Vars, App)),
+    ServiceName = normalize(maps:get(service_name, Vars, App)),
+    AutoStart = normalize(maps:get(auto_start, Vars, "true")),
+    InstallLog = filename:join(LogDir, "install.log"),
+    iolist_to_binary([
+        "#!/bin/sh\n",
+        "set -eu\n\n",
+        "APP=", shell_quote(App), "\n",
+        "PREFIX=", shell_quote(Prefix), "\n",
+        "INSTALL_DIR=", shell_quote(InstallDir), "\n",
+        "BIN=", shell_quote(Bin), "\n",
+        "LINK=", shell_quote(Link), "\n",
+        "ETC_DIR=", shell_quote(EtcDir), "\n",
+        "VAR_DIR=", shell_quote(VarDir), "\n",
+        "LOG_DIR=", shell_quote(LogDir), "\n",
+        "CREATE_USER=", shell_quote(CreateUser), "\n",
+        "PKG_USER=", shell_quote(User), "\n",
+        "PKG_GROUP=", shell_quote(Group), "\n",
+        "USER=", shell_quote(User), "\n",
+        "GROUP=", shell_quote(Group), "\n",
+        "SERVICE_NAME=", shell_quote(ServiceName), "\n",
+        "AUTO_START=", shell_quote(AutoStart), "\n",
+        "INSTALL_LOG=", shell_quote(InstallLog), "\n",
+        "POSTINST_DIR=\"${INSTALL_DIR}/postinst.d\"\n",
+        "export APP PREFIX INSTALL_DIR BIN LINK ETC_DIR VAR_DIR LOG_DIR ",
+        "CREATE_USER PKG_USER PKG_GROUP USER GROUP SERVICE_NAME AUTO_START INSTALL_LOG\n\n",
+        "mkdir -p \"$LOG_DIR\"\n",
+        "touch \"$INSTALL_LOG\"\n",
+        "chmod 0640 \"$INSTALL_LOG\" 2>/dev/null || true\n\n",
+        "log() {\n",
+        "  _line=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date) ",
+        "[postinst][runner] $*\"\n",
+        "  printf '%s\\n' \"$_line\"\n",
+        "  printf '%s\\n' \"$_line\" >>\"$INSTALL_LOG\" 2>/dev/null || true\n",
+        "}\n\n",
+        "case \"${1:-}\" in\n",
+        "  abort-upgrade|abort-remove|abort-deconfigure|remove|purge)\n",
+        "    log \"Lifecycle action ${1:-unknown}; no configure hooks required\"\n",
+        "    exit 0\n",
+        "    ;;\n",
+        "esac\n\n",
+        "if [ ! -d \"$POSTINST_DIR\" ]; then\n",
+        "  log \"No postinst.d directory at $POSTINST_DIR\"\n",
+        "  exit 0\n",
+        "fi\n\n",
+        "for hook in \"$POSTINST_DIR\"/*.sh; do\n",
+        "  [ -f \"$hook\" ] || continue\n",
+        "  chmod 0755 \"$hook\" 2>/dev/null || true\n",
+        "  log \"Running $(basename \"$hook\")\"\n",
+        "  if \"$hook\" configure; then\n",
+        "    log \"Completed $(basename \"$hook\")\"\n",
+        "  else\n",
+        "    _status=$?\n",
+        "    log \"ERROR: $(basename \"$hook\") failed with status $_status\"\n",
+        "    exit \"$_status\"\n",
+        "  fi\n",
+        "done\n\n",
+        "log \"All post-install hooks completed\"\n",
+        "exit 0\n"
+    ]).
+
+shell_quote(V) ->
+    S = normalize(V),
+    [$' | escape_squotes(S)] ++ [$'].
+
 %% ---------- Target generators ----------
 
 do_deb(State, Cfg) ->
@@ -554,8 +651,10 @@ do_deb(State, Cfg) ->
     ok = write_file(Postinst, render_file("deb/postinst.mustache", Vars)),
     ok = file:change_mode(Postinst, 8#755),
 
-    %% OPTIONAL: copy postinst.d to release tree so fpm can package it
+    %% Stage shared postinst.d hooks and use one FPM lifecycle runner for
+    %% every package target.
     ok = maybe_copy_postinst_d(Meta, Vars),
+    FpmPostinst = write_fpm_postinst(Base, Vars),
 
     %% fpm toggle
     {Args, _} = rebar_state:command_parsed_args(State),
@@ -570,7 +669,7 @@ do_deb(State, Cfg) ->
 
     FpmMeta = merge_meta(Vars, #{
         fpm => FpmFlag,
-        after_install => Postinst,
+        after_install => FpmPostinst,
         install_prefix => InstallPrefix
     }),
 
@@ -615,6 +714,9 @@ do_arch(State, Cfg) ->
         render_file("arch/PKGBUILD.mustache", Vars)
     ),
 
+    ok = maybe_copy_postinst_d(Meta, Vars),
+    FpmPostinst = write_fpm_postinst(Out, Vars),
+
     %% fpm toggle
     {Args, _} = rebar_state:command_parsed_args(State),
     FpmFlag =
@@ -627,7 +729,7 @@ do_arch(State, Cfg) ->
     InstallPrefix = proplists:get_value(install_prefix, Meta, "/opt"),
     FpmMeta = merge_meta(Vars, #{
         fpm => FpmFlag,
-        after_install => Postinst,
+        after_install => FpmPostinst,
         install_prefix => InstallPrefix
     }),
 
@@ -647,11 +749,32 @@ do_rpm(State, Cfg) ->
         join_all([Out, App ++ ".spec"]),
         render_file("rpm/spec.mustache", Vars)
     ),
-    maybe_fpm(Vars, rpm),
+
+    ok = maybe_copy_postinst_d(Meta, Vars),
+    FpmPostinst = write_fpm_postinst(Out, Vars),
+
+    {Args, _} = rebar_state:command_parsed_args(State),
+    FpmFlag =
+        case proplists:get_value(fpm, Args) of
+            true -> true;
+            false -> false;
+            undefined -> proplists:get_value(fpm, Cfg, true)
+        end,
+
+    InstallPrefix = proplists:get_value(install_prefix, Meta, "/opt"),
+    FpmMeta = merge_meta(Vars, #{
+        fpm => FpmFlag,
+        after_install => FpmPostinst,
+        install_prefix => InstallPrefix
+    }),
+
+    maybe_fpm(FpmMeta, rpm),
     rebar_api:info("rpm: wrote spec to ~s", [Out]),
     ok.
 
 %% ---- fpm integration (fpm >= 1.17.0) -------------------------------
+strip_trailing_slash([]) -> [];
+strip_trailing_slash("/") -> "/";
 strip_trailing_slash(P) ->
     case lists:last(P) of
         $/ -> lists:sublist(P, 1, length(P) - 1);
@@ -666,16 +789,7 @@ maybe_fpm(Meta, Target) ->
             ok;
         true ->
             App = maps:get(app, Meta),
-            % Normalize prefix so we always get /opt/<app>
-            Prefix0 = maps:get(install_prefix, Meta, "/opt"),
-            Prefix1 = strip_trailing_slash(Prefix0),
-            Prefix =
-                case filename:basename(Prefix1) of
-                    % already /opt/<app>
-                    App -> Prefix1;
-                    % becomes /opt/<app>
-                    _ -> filename:join(Prefix1, App)
-                end,
+            Prefix = package_install_dir(Meta),
             Version = maps:get(version, Meta),
             Arch = maps:get(arch, Meta, "native"),
 
@@ -826,8 +940,8 @@ fpm_inputs(Meta, RelDir0, Prefix) ->
         SystemdUnit ++ "=" ++ ServiceDest
     ].
 
-%% If {postinst_d, Dir} is set in Meta, copy Dir -> <release>/postinst.d
-%% so FPM will include it under ${install_prefix}/${app}/postinst.d
+%% If {postinst_d, Dir} is set in Meta, copy Dir -> <release>/postinst.d.
+%% The release payload is shared by DEB/RPM/Arch FPM targets.
 maybe_copy_postinst_d(Meta, Vars) ->
     case proplists:get_value(postinst_d, Meta) of
         undefined ->
@@ -838,7 +952,7 @@ maybe_copy_postinst_d(Meta, Vars) ->
             case filelib:is_dir(Src) of
                 false ->
                     rebar_api:warn(
-                        "deb: postinst_d path ~s is not a directory, skipping",
+                        "pkg: postinst_d path ~s is not a directory, skipping",
                         [Src]
                     ),
                     ok;
@@ -858,9 +972,9 @@ copy_postinst_dir(Src, Dest) ->
     %% cp -a "$Src/." "$Dest/"
     Argv = ["cp", "-a", Src ++ "/.", Dest ++ "/"],
     Cmd = string:join([shell_escape(A) || A <- Argv], " "),
-    rebar_api:info("deb: copying postinst_d via: ~s", [Cmd]),
+    rebar_api:info("pkg: copying postinst_d via: ~s", [Cmd]),
     Out = os:cmd(Cmd),
-    rebar_api:info("deb: postinst_d copy output:~n~s", [Out]),
+    rebar_api:info("pkg: postinst_d copy output:~n~s", [Out]),
     ok.
 
 maybe_postinst_d_suffix(Meta) ->
