@@ -688,7 +688,16 @@ do_arch(State, Cfg) ->
     ensure_out_dir(Out),
 
     %% Base Vars
-    Vars0 = meta_to_vars(Meta),
+    Vars00 = meta_to_vars(Meta),
+    ArchVersion = arch_pkgver(maps:get(version, Vars00)),
+    Vars0 = Vars00#{
+        version => ArchVersion
+    },
+
+    rebar_api:info(
+        "arch: pkgver ~s -> ~s",
+        [maps:get(version, Vars00), ArchVersion]
+    ),
 
     %% Resolve Arch fields
     ArchDependsL = plat_specs(Meta, depends, arch),
@@ -771,6 +780,24 @@ do_rpm(State, Cfg) ->
     maybe_fpm(FpmMeta, rpm),
     rebar_api:info("rpm: wrote spec to ~s", [Out]),
     ok.
+
+%% Arch pkgver cannot contain '-' even though it is valid SemVer.
+%% Keep the canonical project/release version unchanged and normalize only
+%% the value written to PKGBUILD / passed to pacman packaging.
+arch_pkgver(Vsn0) ->
+    Vsn = normalize(Vsn0),
+    [
+        case C of
+            $- -> $_;
+            $: -> $_;
+            $/ -> $_;
+            $\s -> $_;
+            $\t -> $_;
+            $\n -> $_;
+            _ -> C
+        end
+     || C <- Vsn
+    ].
 
 %% ---- fpm integration (fpm >= 1.17.0) -------------------------------
 strip_trailing_slash([]) -> [];
