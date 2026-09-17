@@ -120,12 +120,8 @@ gen(State, Cfg, rpm) -> do_rpm(State, Cfg);
 gen(State, Cfg, deb) -> do_deb(State, Cfg).
 
 current_profile(State) ->
-    case rebar_state:current_profiles(State) of
-        % Currently only support one profile at a time
-        [default, P] -> atom_to_list(P);
-        [default] -> "default";
-        [] -> "default"
-    end.
+    %% The active build directory is authoritative, including combined profiles.
+    filename:basename(rebar_dir:base_dir(State)).
 
 maybe_release_app_from_config(State) ->
     %% Try to find {release, {App,_},_} or {release, App,_} in config
@@ -166,7 +162,7 @@ maybe_release_app_from_build(Profile) ->
 find_appinfo(App, Apps) ->
     %% Apps :: [rebar_app_info()]
     Apps0 = [{rebar_app_info:name(AI), AI} || AI <- Apps],
-    case lists:keyfind(atom_to_binary(App), 1, Apps0) of
+    case lists:keyfind(unicode:characters_to_binary(normalize(App)), 1, Apps0) of
         false -> undefined;
         {_Name, AI} -> AI
     end.
@@ -198,6 +194,17 @@ release_version(Profile0, App0) ->
 to_list(V) ->
     rebar3_pkg_version:to_list(V).
 
+resolve_version(Args, Profile, AppAtom, undefined, _BaseDir) ->
+    %% A release such as aeternity may not be an OTP application. Do not pass
+    %% undefined into application-version resolution for umbrella packages.
+    case proplists:get_value(version, Args) of
+        undefined ->
+            case release_version(Profile, AppAtom) of
+                {ok, Vsn} -> Vsn;
+                Error -> error({release_version_unavailable, AppAtom, Error})
+            end;
+        Vsn -> to_list(Vsn)
+    end;
 resolve_version(Args, Profile, AppAtom, AppInfo, BaseDir) ->
     ReleaseFun = release_fun(Profile, AppAtom),
     {Vsn, Source} = rebar3_pkg_version:resolve(Args, BaseDir, AppInfo, ReleaseFun),
@@ -258,7 +265,7 @@ project_app(State, Profile) ->
     AppName =
         case AppAtom0 of
             undefined -> "unknown_app";
-            A1 -> atom_to_list(A1)
+            A1 -> normalize(A1)
         end,
     {AppAtom0, AppInfo, AppName}.
 
@@ -289,11 +296,19 @@ project_meta(State, Cfg) ->
             O -> O
         end,
 
-    AppDetails = rebar_app_info:app_details(AppInfo),
-    Maintainer = proplists:get_value(maintainer, AppDetails),
-    Links = proplists:get_value(links, AppDetails),
-    Licenses = string:join(proplists:get_value(licenses, AppDetails), " "),
-    Description = proplists:get_value(description, AppDetails),
+    %% An umbrella release need not have an application of the same name.
+    AppDetails = case AppInfo of
+        undefined -> [];
+        _ -> rebar_app_info:app_details(AppInfo)
+    end,
+    Maintainer = proplists:get_value(maintainer, Cfg,
+        proplists:get_value(maintainer, AppDetails, "")),
+    Links = proplists:get_value(links, Cfg,
+        proplists:get_value(links, AppDetails, [])),
+    Licenses = string:join(normalize_spec(proplists:get_value(licenses, Cfg,
+        proplists:get_value(licenses, AppDetails, []))), " "),
+    Description = proplists:get_value(description, Cfg,
+        proplists:get_value(description, AppDetails, AppName)),
 
     %rebar_api:info(
     %    "state: ~p cfg: ~p",
@@ -373,6 +388,7 @@ resolve_app_dir(AppInfo, BaseDir, AppName) ->
 
 systemd_unit_path(Meta) ->
     case proplists:get_value(systemd_unit, Meta) of
+        false -> false;
         undefined -> default_systemd_unit_path(Meta);
         [] -> default_systemd_unit_path(Meta);
         Unit -> normalize(Unit)
@@ -534,6 +550,8 @@ package_install_dir(Meta) ->
 %% FPM accepts a normal shell script for --after-install and adapts it to the
 %% target package format. Generate one common runner for deb/rpm/pacman rather
 %% than maintaining distro-specific lifecycle behavior.
+write_fpm_postinst(_OutDir, #{postinst_d := undefined}) -> undefined;
+write_fpm_postinst(_OutDir, #{postinst_d := []}) -> undefined;
 write_fpm_postinst(OutDir, Vars) ->
     Path = join_all([OutDir, "fpm-postinstall.sh"]),
     ok = write_file(Path, fpm_postinst_script(Vars)),
@@ -669,11 +687,12 @@ do_deb(State, Cfg) ->
 
     FpmMeta = merge_meta(Vars, #{
         fpm => FpmFlag,
+        package_depends => plat_specs(Meta, depends, deb),
         after_install => FpmPostinst,
         install_prefix => InstallPrefix
     }),
 
-    maybe_fpm(FpmMeta, deb),
+    ok = maybe_fpm(FpmMeta, deb),
     rebar_api:info(
         "deb: wrote control, postinst~s in ~s",
         [maybe_postinst_d_suffix(Meta), Base]
@@ -714,36 +733,35 @@ do_arch(State, Cfg) ->
         optdepends => ArchOptdepends
     },
 
-    Postinst = join_all([Out, App ++ ".install"]),
-    ok = write_file(Postinst, render_file("arch/pkg.install.mustache", Vars)),
-    ok = file:change_mode(Postinst, 8#755),
-
-    ok = write_file(
-        join_all([Out, "PKGBUILD"]),
-        render_file("arch/PKGBUILD.mustache", Vars)
-    ),
-
+    {Args, _} = rebar_state:command_parsed_args(State),
+    FpmFlag = case proplists:get_value(fpm, Args) of
+        undefined -> proplists:get_value(fpm, Cfg, true);
+        Flag -> Flag
+    end,
+    %% FPM consumes the release directly; PKGBUILD templates are a separate
+    %% scaffold path and must not be mandatory for binary package generation.
+    case FpmFlag of
+        true -> ok;
+        false ->
+            Postinst = join_all([Out, App ++ ".install"]),
+            ok = write_file(Postinst, render_file("arch/pkg.install.mustache", Vars)),
+            ok = file:change_mode(Postinst, 8#755),
+            ok = write_file(join_all([Out, "PKGBUILD"]),
+                            render_file("arch/PKGBUILD.mustache", Vars))
+    end,
     ok = maybe_copy_postinst_d(Meta, Vars),
     FpmPostinst = write_fpm_postinst(Out, Vars),
-
-    %% fpm toggle
-    {Args, _} = rebar_state:command_parsed_args(State),
-    FpmFlag =
-        case proplists:get_value(fpm, Args) of
-            true -> true;
-            false -> false;
-            undefined -> proplists:get_value(fpm, Cfg, true)
-        end,
 
     InstallPrefix = proplists:get_value(install_prefix, Meta, "/opt"),
     FpmMeta = merge_meta(Vars, #{
         fpm => FpmFlag,
+        package_depends => plat_specs(Meta, depends, arch),
         after_install => FpmPostinst,
         install_prefix => InstallPrefix
     }),
 
-    maybe_fpm(FpmMeta, arch),
-    rebar_api:info("arch: wrote ~s", [join_all([Out, "PKGBUILD"])]),
+    ok = maybe_fpm(FpmMeta, arch),
+    rebar_api:info("arch: output under ~s", [OutDir]),
     ok.
 
 do_rpm(State, Cfg) ->
@@ -773,11 +791,12 @@ do_rpm(State, Cfg) ->
     InstallPrefix = proplists:get_value(install_prefix, Meta, "/opt"),
     FpmMeta = merge_meta(Vars, #{
         fpm => FpmFlag,
+        package_depends => plat_specs(Meta, depends, rpm),
         after_install => FpmPostinst,
         install_prefix => InstallPrefix
     }),
 
-    maybe_fpm(FpmMeta, rpm),
+    ok = maybe_fpm(FpmMeta, rpm),
     rebar_api:info("rpm: wrote spec to ~s", [Out]),
     ok.
 
@@ -826,7 +845,7 @@ maybe_fpm(Meta, Target) ->
 
             OutBase = maps:get(out_dir, Meta, "_build/pkg"),
             Maint = maps:get(maintainer, Meta, undefined),
-            Lic = maps:get(license, Meta, undefined),
+            Lic = maps:get(licenses, Meta, undefined),
             Url = maps:get(homepage, Meta, undefined),
             Desc = maps:get(description, Meta, undefined),
 
@@ -839,10 +858,7 @@ maybe_fpm(Meta, Target) ->
             TargetDir = filename:join(OutBase, type_to_dir(Target)),
             ok = filelib:ensure_dir(filename:join(TargetDir, "placeholder")),
 
-            Pattern = filename:join([TargetDir, App ++ "*"]),
-            rebar_api:info("fpm: cleaning old packages: ~s", [Pattern]),
-            lists:foreach(fun file:delete/1, filelib:wildcard(Pattern)),
-
+            %% --force replaces the selected output; retain other versions.
             OutArg = filename:join(TargetDir, "") ++ "/",
 
             BaseArgs = [
@@ -893,7 +909,10 @@ maybe_fpm(Meta, Target) ->
                 ),
 
             Inputs = fpm_inputs(Meta, RelDir, Prefix),
-            Argv = BaseArgs ++ OptMeta ++ ScriptMeta ++ Inputs,
+            DependsArgs = lists:append([
+                ["--depends", D] || D <- maps:get(package_depends, Meta, [])
+            ]),
+            Argv = BaseArgs ++ OptMeta ++ DependsArgs ++ ScriptMeta ++ Inputs,
             Cmd = string:join([shell_escape(A) || A <- Argv], " "),
 
             rebar_api:info("fpm cmd: ~s", [Cmd]),
@@ -938,34 +957,32 @@ maybe_fpm(Meta, Target) ->
 
 %% Package the release and systemd unit from one canonical source for every
 %% target. Explicit source=destination mappings avoid --prefix incorrectly
-%% placing /etc/systemd/system below the application prefix.
+%% placing vendor systemd units below the application prefix.
 fpm_inputs(Meta, RelDir0, Prefix) ->
     RelDir = filename:absname(RelDir0),
     App = normalize(maps:get(app, Meta)),
     ServiceName = normalize(maps:get(service_name, Meta, App)),
     AppDir = normalize(maps:get(app_dir, Meta, ".")),
-    SystemdUnit0 = normalize(
-        maps:get(
-            systemd_unit,
-            Meta,
-            filename:join([AppDir, "priv", "pkg", App ++ ".service"])
-        )
-    ),
-    SystemdUnit = filename:absname(SystemdUnit0),
-    case filelib:is_regular(SystemdUnit) of
-        true ->
-            ok;
-        false ->
-            error({systemd_unit_not_found, SystemdUnit})
+    case filelib:is_dir(RelDir) of
+        true -> ok;
+        false -> error({release_dir_not_found, RelDir})
     end,
-    ServiceDest = filename:join([
-        "/etc/systemd/system",
-        ServiceName ++ ".service"
-    ]),
-    [
-        RelDir ++ "/=" ++ Prefix,
-        SystemdUnit ++ "=" ++ ServiceDest
-    ].
+    ReleaseInput = RelDir ++ "/=" ++ Prefix,
+    case maps:get(systemd_unit, Meta, undefined) of
+        false -> [ReleaseInput];
+        ConfiguredUnit ->
+            Unit0 = case ConfiguredUnit of
+                undefined -> filename:join([AppDir, "priv", "pkg", App ++ ".service"]);
+                _ -> normalize(ConfiguredUnit)
+            end,
+            Unit = filename:absname(Unit0),
+            case filelib:is_regular(Unit) of
+                true -> ok;
+                false -> error({systemd_unit_not_found, Unit})
+            end,
+            ServiceDest = filename:join(["/usr/lib/systemd/system", ServiceName ++ ".service"]),
+            [ReleaseInput, Unit ++ "=" ++ ServiceDest]
+    end.
 
 %% If {postinst_d, Dir} is set in Meta, copy Dir -> <release>/postinst.d.
 %% The release payload is shared by DEB/RPM/Arch FPM targets.
@@ -1023,23 +1040,61 @@ add_opt(_Flag, undefined, Acc) -> Acc;
 add_opt(_Flag, [], Acc) -> Acc;
 add_opt(Flag, Val, Acc) -> Acc ++ [Flag, Val].
 
-shell_escape(S) when is_list(S) ->
-    %% If S has whitespace or quotes, wrap it in single quotes and
-    %% escape any embedded single-quotes as: '\''  (end, backslash-quote, start)
-    NeedsQuoting =
-        lists:any(
-            fun(C) ->
-                (C =< 32) orelse (C =:= $") orelse (C =:= $\')
-            end,
-            S
-        ),
-    case NeedsQuoting of
-        true -> [$' | escape_squotes(S)] ++ [$'];
-        false -> S
-    end;
-shell_escape(B) when is_binary(B) -> shell_escape(binary_to_list(B));
-shell_escape(A) when is_atom(A) -> shell_escape(atom_to_list(A)).
+%% Quote every argument, including shell metacharacters without whitespace.
+shell_escape(Value) -> shell_quote(Value).
 
 escape_squotes([]) -> [];
 escape_squotes([$' | T]) -> [$', $\\, $', $' | escape_squotes(T)];
 escape_squotes([H | T]) -> [H | escape_squotes(T)].
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+shell_argument_quoting_test() ->
+    ?assertEqual("'x$(id);y'", shell_escape("x$(id);y")),
+    ?assertEqual("''", shell_escape(<<>>)).
+
+arch_dependencies_remain_individual_test() ->
+    Meta = [{depends, [{arch, ["glibc", "openssl"]}, {deb, "libssl3"}]}],
+    ?assertEqual(["glibc", "openssl"], plat_specs(Meta, depends, arch)).
+
+release_only_configuration_test() ->
+    ?assertEqual(false, systemd_unit_path([{systemd_unit, false}])),
+    ?assertEqual(undefined, write_fpm_postinst("unused", #{postinst_d => undefined})),
+    ?assertEqual("/opt/aeternity",
+        package_install_dir(#{app => "aeternity", install_prefix => "/opt"})),
+    ?assertEqual("/opt/aeternity",
+        package_install_dir(#{app => "aeternity", install_prefix => "/opt/aeternity/"})).
+
+%% Exercise the external command boundary without requiring an installed FPM.
+fpm_failure_and_metadata_test() ->
+    TempRoot = case os:getenv("TMPDIR") of false -> "/tmp"; V -> V end,
+    Dir = filename:join(TempRoot,
+        "rebar3_pkg_test_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    Fake = filename:join(Dir, "fpm"),
+    Bin = filename:join([Dir, "rel", "bin", "aeternity"]),
+    ok = filelib:ensure_dir(Bin),
+    ok = file:write_file(Fake,
+        <<"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nexit 7\n">>),
+    ok = file:change_mode(Fake, 8#755),
+    OldPath = os:getenv("PATH"),
+    Tail = case OldPath of false -> "/usr/bin:/bin"; P -> P end,
+    try
+        true = os:putenv("PATH", Dir ++ ":" ++ Tail),
+        Meta = #{app => "aeternity", version => "1.2.3", fpm => true,
+                 bin_path => Bin, out_dir => filename:join(Dir, "packages"),
+                 systemd_unit => false, licenses => "ISC",
+                 description => "literal $(id); text",
+                 package_depends => ["glibc", "openssl"]},
+        ?assertEqual({error, {fpm_failed, 7}}, maybe_fpm(Meta, arch)),
+        {ok, Bytes} = file:read_file(Fake ++ ".args"),
+        Args = string:tokens(binary_to_list(Bytes), "\n"),
+        ?assert(lists:member("literal $(id); text", Args)),
+        ?assert(string:str(binary_to_list(Bytes), "--depends\nglibc\n") > 0),
+        ?assert(string:str(binary_to_list(Bytes), "--depends\nopenssl\n") > 0),
+        ?assert(string:str(binary_to_list(Bytes), "--license\nISC\n") > 0)
+    after
+        case OldPath of false -> os:unsetenv("PATH"); _ -> os:putenv("PATH", OldPath) end,
+        file:del_dir_r(Dir)
+    end.
+-endif.
