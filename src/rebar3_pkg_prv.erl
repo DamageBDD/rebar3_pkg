@@ -534,7 +534,6 @@ deb_join(L) -> string:join(L, ", ").
 %% Let the template add the surrounding ().
 -spec arch_array_items([string()]) -> string().
 %% Return a complete Bash array expression.
-arch_array_items([]) -> "";
 arch_array_items(Items) ->
     "(" ++ string:join([shell_quote(Item) || Item <- Items], " ") ++ ")".
 
