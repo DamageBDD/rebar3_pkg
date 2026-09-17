@@ -734,6 +734,11 @@ do_arch(State, Cfg) ->
         optdepends => ArchOptdepends
     },
 
+    %% Application-specific installation behavior lives here.
+    %% rebar3_pkg does not interpret the contents.
+    ok = maybe_copy_postinst_d(Meta, Vars),
+
+
     {Args, _} = rebar_state:command_parsed_args(State),
     FpmFlag = case proplists:get_value(fpm, Args) of
         undefined -> proplists:get_value(fpm, Cfg, true);
@@ -985,8 +990,8 @@ fpm_inputs(Meta, RelDir0, Prefix) ->
             [ReleaseInput, Unit ++ "=" ++ ServiceDest]
     end.
 
-%% If {postinst_d, Dir} is set in Meta, copy Dir -> <release>/postinst.d.
-%% The release payload is shared by DEB/RPM/Arch FPM targets.
+%% Copy application-owned installation hooks into the release.
+%% The packaging provider deliberately does not interpret these hooks.
 maybe_copy_postinst_d(Meta, Vars) ->
     case proplists:get_value(postinst_d, Meta) of
         undefined ->
