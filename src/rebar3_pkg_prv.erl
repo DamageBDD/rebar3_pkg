@@ -533,8 +533,10 @@ deb_join(L) -> string:join(L, ", ").
 %% Return **just the quoted items**: "'a' 'b'" (no parentheses).
 %% Let the template add the surrounding ().
 -spec arch_array_items([string()]) -> string().
+%% Return a complete Bash array expression.
 arch_array_items([]) -> "";
-arch_array_items(L) -> "('" ++ string:join(L, "' '") ++ "')".
+arch_array_items(Items) ->
+    "(" ++ string:join([shell_quote(Item) || Item <- Items], " ") ++ ")".
 
 %% Resolve the final application install directory exactly once so the FPM
 %% payload and the common after-install runner agree on the same path.
