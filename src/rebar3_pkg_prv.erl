@@ -752,8 +752,13 @@ do_arch(State, Cfg) ->
             Postinst = join_all([Out, App ++ ".install"]),
             ok = write_file(Postinst, render_file("arch/pkg.install.mustache", Vars)),
             ok = file:change_mode(Postinst, 8#755),
-            ok = write_file(join_all([Out, "PKGBUILD"]),
-                            render_file("arch/PKGBUILD.mustache", Vars))
+            %% The non-FPM makepkg path must ship the same canonical service
+            %% that fpm_inputs/3 installs for DEB/RPM/Arch FPM packages.
+            %% Stage its source and extend the generated PKGBUILD fail-closed:
+            %% a missing/non-standard package() function is a packaging error.
+            PKGBUILD0 = render_file("arch/PKGBUILD.mustache", Vars),
+            PKGBUILD = arch_pkgbuild_with_systemd_unit(PKGBUILD0, Vars, Out),
+            ok = write_file(join_all([Out, "PKGBUILD"]), PKGBUILD)
     end,
     ok = maybe_copy_postinst_d(Meta, Vars),
     FpmPostinst = write_fpm_postinst(Out, Vars),
@@ -769,6 +774,80 @@ do_arch(State, Cfg) ->
     ok = maybe_fpm(FpmMeta, arch),
     rebar_api:info("arch: output under ~s", [OutDir]),
     ok.
+
+%% The FPM and makepkg paths must install the same application-owned unit.
+%% The service is a makepkg source with an SHA-256 checksum, so a package can
+%% never silently acquire a missing or altered unit during a release build.
+arch_pkgbuild_with_systemd_unit(PKGBUILD, #{systemd_unit := false}, _Out) ->
+    PKGBUILD;
+arch_pkgbuild_with_systemd_unit(PKGBUILD, Vars, Out) ->
+    App = normalize(maps:get(app, Vars)),
+    ServiceName = normalize(maps:get(service_name, Vars, App)),
+    %% Service names become local source filenames and Bash string fragments.
+    %% Do not allow separators, whitespace or Bash metacharacters through.
+    case re:run(ServiceName, "^[A-Za-z0-9@_.-]+$", [{capture, none}]) of
+        match -> ok;
+        nomatch -> error({invalid_systemd_service_name, ServiceName})
+    end,
+    UnitName = ServiceName ++ ".service",
+    UnitPath = filename:absname(normalize(maps:get(systemd_unit, Vars))),
+    UnitBin =
+        case file:read_file(UnitPath) of
+            {ok, Bin} when byte_size(Bin) > 0 -> Bin;
+            Error -> error({systemd_unit_unreadable, UnitPath, Error})
+        end,
+    %% The caller owns _build/pkg/arch/<app>. Keep the source immediately
+    %% next to PKGBUILD, where makepkg resolves local source=('name.service').
+    StagedUnit = filename:join(Out, UnitName),
+    ok = write_file(StagedUnit, UnitBin),
+    ok = file:change_mode(StagedUnit, 8#644),
+    Digest = string:lowercase(binary_to_list(binary:encode_hex(crypto:hash(sha256, UnitBin)))),
+    arch_pkgbuild_add_systemd_unit(PKGBUILD, UnitName, Digest).
+
+arch_pkgbuild_add_systemd_unit(PKGBUILD0, UnitName, Digest) ->
+    %% Preserve existing package() implementation, while guaranteeing the
+    %% vendor unit is installed into pkgdir rather than the build host.
+    %% Reject templates whose package() definition cannot be recognized.
+    Pattern = <<"(?m)^package[ \\t]*\\(\\)[ \\t]*\\{">>,
+    case re:run(PKGBUILD0, Pattern, [global]) of
+        {match, [_]} -> ok;
+        _ -> error({arch_pkgbuild_package_function_not_found_or_ambiguous})
+    end,
+    PKGBUILD1 = re:replace(
+        PKGBUILD0, Pattern, <<"damagebdd_original_package() {">>, [{return, binary}]
+    ),
+    %% The digest is checked by makepkg. If this PKGBUILD does not already
+    %% declare sha256sums, mark its pre-existing sources SKIP for this *new*
+    %% algorithm; their other original checksum arrays stay intact. Preserve
+    %% array lengths for any other checksum algorithms the template declares.
+    %% This is evaluated by Bash when makepkg sources the generated PKGBUILD.
+    UnitDeclaration = [
+        "\n# rebar3_pkg: verified canonical systemd unit source.\n",
+        "source+=(", shell_quote(UnitName), ")\n",
+        "if declare -p sha256sums >/dev/null 2>&1; then\n",
+        "    sha256sums+=(", shell_quote(Digest), ")\n",
+        "else\n",
+        "    sha256sums=()\n",
+        "    for (( _damage_src=1; _damage_src<${#source[@]}; _damage_src++ )); do\n",
+        "        sha256sums+=('SKIP')\n",
+        "    done\n",
+        "    sha256sums+=(", shell_quote(Digest), ")\n",
+        "fi\n",
+        "for _damage_sum in md5sums sha1sums sha224sums sha384sums sha512sums b2sums; do\n",
+        "    if declare -p \"$_damage_sum\" >/dev/null 2>&1; then\n",
+        "        declare -n _damage_ref=\"$_damage_sum\"\n",
+        "        _damage_ref+=('SKIP')\n",
+        "        unset -n _damage_ref\n",
+        "    fi\n",
+        "done\n",
+        "unset _damage_src _damage_sum\n",
+        "package() {\n",
+        "    damagebdd_original_package \"$@\"\n",
+        "    install -Dm644 \"${srcdir}/", UnitName,
+        "\" \"${pkgdir}/usr/lib/systemd/system/", UnitName, "\"\n",
+        "}\n"
+    ],
+    iolist_to_binary([PKGBUILD1, UnitDeclaration]).
 
 do_rpm(State, Cfg) ->
     Meta = project_meta(State, Cfg),
@@ -1071,6 +1150,46 @@ release_only_configuration_test() ->
         package_install_dir(#{app => "aeternity", install_prefix => "/opt"})),
     ?assertEqual("/opt/aeternity",
         package_install_dir(#{app => "aeternity", install_prefix => "/opt/aeternity/"})).
+
+arch_pkgbuild_systemd_unit_test() ->
+    Base = <<"pkgname=damage\nsource=('release.tar.gz')\nsha256sums=('SKIP')\n"
+             "package() {\n  install -d \"$pkgdir/opt/damage\"\n}\n">>,
+    Result = arch_pkgbuild_add_systemd_unit(
+        Base, "damage.service", "0123456789abcdef"
+    ),
+    ?assertNotEqual(nomatch, binary:match(Result, <<"damagebdd_original_package() {">>)),
+    ?assertNotEqual(nomatch, binary:match(Result, <<"source+=('damage.service')">>)),
+    ?assertNotEqual(nomatch, binary:match(Result, <<"sha256sums+=('0123456789abcdef')">>)),
+    ?assertNotEqual(nomatch, binary:match(Result, <<"usr/lib/systemd/system/damage.service">>)),
+    ?assertEqual(1, length(binary:matches(Result, <<"\npackage() {">>))).
+
+arch_pkgbuild_stages_unit_test() ->
+    TempRoot = case os:getenv("TMPDIR") of false -> "/tmp"; V -> V end,
+    Dir = filename:join(TempRoot,
+        "rebar3_pkg_arch_unit_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    UnitPath = filename:join(Dir, "canonical.service"),
+    StagedUnit = filename:join(Dir, "damage.service"),
+    PKGBUILD = <<"source=()\npackage() {\n  :\n}\n">>,
+    ok = filelib:ensure_dir(UnitPath),
+    try
+        ok = file:write_file(UnitPath, <<"[Unit]\nDescription=DamageBDD\n">>),
+        Vars = #{app => "damage", service_name => "damage", systemd_unit => UnitPath},
+        Rendered = arch_pkgbuild_with_systemd_unit(PKGBUILD, Vars, Dir),
+        ?assertEqual({ok, <<"[Unit]\nDescription=DamageBDD\n">>},
+            file:read_file(StagedUnit)),
+        ?assertNotEqual(nomatch,
+            binary:match(Rendered, <<"source+=('damage.service')">>)),
+        ?assertEqual(PKGBUILD,
+            arch_pkgbuild_with_systemd_unit(PKGBUILD, #{systemd_unit => false}, Dir))
+    after
+        file:del_dir_r(Dir)
+    end.
+
+arch_pkgbuild_missing_package_function_test() ->
+    ?assertError(
+        {arch_pkgbuild_package_function_not_found_or_ambiguous},
+        arch_pkgbuild_add_systemd_unit(<<"pkgname=damage\n">>, "damage.service", "abc")
+    ).
 
 %% Exercise the external command boundary without requiring an installed FPM.
 fpm_failure_and_metadata_test() ->
